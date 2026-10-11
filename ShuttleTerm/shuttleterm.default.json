@@ -1,0 +1,30 @@
+{
+  "_comments": [
+    "This file is copied to ~/.shuttleterm.json the first time ShuttleTerm launches.",
+    "You can also add and edit hosts in Settings. You do not need to create the file by hand.",
+    "Per-host keys: name, cmd, after, startup, theme, font, title, reconnect",
+    "Groups: { \"Work\": [ {host}, {host} ] }. Add Group in Settings, or set Group on a host.",
+    "restore_windows: true reopens terminal windows on launch; coding-agent sessions resume where they left off",
+    "lock_after_sleep: true hides terminals after sleep or screen lock until Touch ID or the Mac password",
+    "align_grid: 5x4 or 4x3 — how many cells Align uses in a row or column"
+  ],
+  "launch_at_login": false,
+  "default_theme": "Homebrew",
+  "default_font": "Menlo",
+  "titlebar": "hover",
+  "focus_on_hover": false,
+  "reconnect": true,
+  "restore_windows": true,
+  "lock_after_sleep": false,
+  "align_grid": "5x4",
+  "hosts": [
+    {
+      "name": "Example SSH",
+      "cmd": "ssh username@example.com",
+      "after": "htop",
+      "startup": false,
+      "theme": "Dracula",
+      "font": "Menlo"
+    }
+  ]
+}

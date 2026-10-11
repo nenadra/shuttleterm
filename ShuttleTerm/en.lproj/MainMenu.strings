@@ -1,0 +1,25 @@
+
+/* Class = "NSMenu"; title = "AMainMenu"; ObjectID = "29"; */
+"29.title" = "AMainMenu";
+
+/* Class = "NSMenuItem"; title = "ShuttleTerm"; ObjectID = "56"; */
+"56.title" = "ShuttleTerm";
+
+/* Class = "NSMenu"; title = "ShuttleTerm"; ObjectID = "57"; */
+"57.title" = "ShuttleTerm";
+
+/* Class = "NSMenuItem"; title = "ShuttleTerm Help"; ObjectID = "58"; */
+"58.title" = "ShuttleTerm Help";
+
+/* Class = "NSMenuItem"; title = "Quit ShuttleTerm"; ObjectID = "136"; */
+"136.title" = "Quit ShuttleTerm";
+
+/* Class = "NSMenuItem"; title = "Help"; ObjectID = "638"; */
+"638.title" = "Help";
+
+/* Class = "NSMenuItem"; title = "Quit"; ObjectID = "644"; */
+"644.title" = "Quit";
+
+/* Class = "NSMenuItem"; title = "Settings"; ObjectID = "646"; */
+"646.title" = "Settings";
+

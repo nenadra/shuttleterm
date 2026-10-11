@@ -1,0 +1,58 @@
+{
+  "_comments": [
+    "Example ShuttleTerm config. On first launch the app copies shuttleterm.default.json to ~/.shuttleterm.json.",
+    "hosts is an array of host objects and optional group objects.",
+    "A group is { \"Work\": [ {host}, {host} ] } and becomes a menubar submenu.",
+    "Edit hosts in Settings (Host list, Add Group, Group field on a host), or edit this JSON.",
+    "",
+    "Global keys:",
+    "  default_theme, default_font",
+    "  titlebar: hover | always",
+    "  focus_on_hover, reconnect, restore_windows (coding-agent sessions resume), launch_at_login",
+    "  lock_after_sleep: hide terminals after sleep or screen lock until Touch ID or password",
+    "  align_grid: 5x4 | 4x3  (cells used by Align Right/Left/Top/Bottom)",
+    "",
+    "Each host:",
+    "  name       menu label",
+    "  cmd        command to run (usually ssh user@host)",
+    "  after      optional command sent after the session starts",
+    "  startup    true opens this host when ShuttleTerm launches",
+    "  theme, font  optional per-window appearance",
+    "  title      optional window title (defaults to name)",
+    "  reconnect  optional true/false; omit to use the app setting"
+  ],
+  "launch_at_login": false,
+  "default_theme": "Homebrew",
+  "default_font": "Menlo",
+  "titlebar": "hover",
+  "focus_on_hover": false,
+  "reconnect": true,
+  "restore_windows": true,
+  "lock_after_sleep": false,
+  "align_grid": "5x4",
+  "hosts": [
+    {
+      "name": "Example SSH",
+      "cmd": "ssh username@example.com",
+      "after": "htop",
+      "startup": false,
+      "theme": "Dracula",
+      "font": "Menlo"
+    },
+    {
+      "Production": [
+        {
+          "name": "Production",
+          "cmd": "ssh deploy@prod.example.com",
+          "startup": true,
+          "reconnect": true
+        }
+      ]
+    },
+    {
+      "name": "Local shell",
+      "cmd": "cd ~ && exec $SHELL -l",
+      "startup": false
+    }
+  ]
+}
