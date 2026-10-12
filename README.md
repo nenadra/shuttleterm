@@ -1,3 +1,5 @@
+<img src="icons/shuttleterm-icon.png" width="128" alt="ShuttleTerm">
+
 # ShuttleTerm
 
 A macOS menubar launcher with a built-in terminal. Open saved SSH hosts, local commands, and split grids from the status item or File.
