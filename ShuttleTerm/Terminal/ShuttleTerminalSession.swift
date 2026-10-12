@@ -246,6 +246,12 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         if window.minSize != previousMin {
             window.minSize = previousMin
         }
+        window.contentView?.layoutSubtreeIfNeeded()
+        terminal.needsLayout = true
+        terminal.layoutSubtreeIfNeeded()
+        alignTerminalPaddingToCells(layoutNow: true)
+        applyWindowChrome(force: true)
+        applyFocusAppearance()
         if reveal {
             makeKeyAndOrderFront()
         }
@@ -504,6 +510,8 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
+        alignTerminalPaddingToCells(layoutNow: true)
+        snapWindowHeightToCells()
         alignTerminalPaddingToCells(layoutNow: true)
     }
 
@@ -1270,10 +1278,23 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     }
 
     private func alignTerminalPaddingToCells(layoutNow: Bool = false) {
+        guard !isSnappingPad else { return }
         guard terminalPadTop != nil else { return }
-        let top = edgePad
-        let bottom = edgePad
+        var top = edgePad
+        var bottom = edgePad
         let side = edgePad
+        if edgePad > 0, let holder = terminal.superview, let cellH = terminal.cellDimension?.height, cellH > 1 {
+            let holderH = holder.bounds.height
+            if holderH > 1 {
+                let available = max(0, holderH - 2 * edgePad)
+                let leftover = available - floor(available / cellH) * cellH
+                if leftover >= 1 {
+                    let extraTop = floor(leftover / 2)
+                    top = edgePad + extraTop
+                    bottom = edgePad + (leftover - extraTop)
+                }
+            }
+        }
         let padsChanged = terminalPadTop.constant != top
             || terminalPadLeading.constant != side
             || terminalPadTrailing.constant != -side
@@ -1289,7 +1310,6 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
                 terminal.layoutSubtreeIfNeeded()
             }
         }
-        snapWindowHeightToCells()
     }
 
     private func snapWindowHeightToCells() {
