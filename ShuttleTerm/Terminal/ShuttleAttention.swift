@@ -2,23 +2,22 @@
 //  ShuttleAttention.swift
 //  ShuttleTerm
 //
-//  Dock badge and a lightweight AppKit banner when a terminal session needs
-//  attention. Badge authorization is requested off the main thread so the app
-//  appears in System Settings → Notifications with Badge App Icon. Calling
-//  UNUserNotificationCenter on the main thread at launch can deadlock this
-//  ad-hoc signed app against usernoted/TCC.
+//  One banner and one Notification Center item per terminal window that needs
+//  a response. The Dock badge is that window count. Badge and notification
+//  center APIs run off the main thread so this ad-hoc signed app does not
+//  deadlock against usernoted/TCC at launch.
 //
 
 import AppKit
 import UserNotifications
 
 @objc(ShuttleAttention)
-final class ShuttleAttention: NSObject {
+final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
     @objc static let shared = ShuttleAttention()
 
     private var pendingIds = Set<String>()
+    private var pendingOrder: [String] = []
     private var banners: [String: NSPanel] = [:]
-    private var bannerDismissWork: [String: DispatchWorkItem] = [:]
     private let notifyQueue = DispatchQueue(label: "shuttleterm.attention.notify")
     private var didPrepare = false
 
@@ -30,14 +29,16 @@ final class ShuttleAttention: NSObject {
         notifyQueue.async { [weak self] in
             guard let self, !self.didPrepare else { return }
             self.didPrepare = true
-            UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
+            let center = UNUserNotificationCenter.current()
+            center.delegate = self
+            center.requestAuthorization(options: [.badge, .alert]) { _, _ in }
         }
     }
 
     func hideBannersForAppLock() {
         onMain {
             for id in Array(self.banners.keys) {
-                self.dismissBanner(id)
+                self.hideBanner(id)
             }
         }
     }
@@ -76,8 +77,13 @@ final class ShuttleAttention: NSObject {
     }
 
     private func raiseLocked(session: ShuttleTerminalSession) {
-        pendingIds.insert(session.attentionId)
+        insertPending(session.attentionId)
         refreshBadge()
+        postWindowNotification(
+            attentionId: session.attentionId,
+            title: session.attentionTitle,
+            body: session.attentionBody
+        )
     }
 
     func clear(_ session: ShuttleTerminalSession) {
@@ -89,24 +95,33 @@ final class ShuttleAttention: NSObject {
     private func raise(session: ShuttleTerminalSession, title: String, body: String) {
         prepare()
         let id = session.attentionId
-        pendingIds.insert(id)
+        insertPending(id)
         refreshBadge()
         NSApp.requestUserAttention(.informationalRequest)
-        if banners[id] != nil {
-            scheduleBannerDismiss(attentionId: id)
-            return
+        postWindowNotification(attentionId: id, title: title, body: body)
+        if banners[id] == nil {
+            showBanner(attentionId: id, title: title, body: body)
+        } else {
+            layoutBanners()
         }
-        showBanner(attentionId: id, title: title, body: body)
+    }
+
+    private func insertPending(_ id: String) {
+        if pendingIds.insert(id).inserted {
+            pendingOrder.append(id)
+        }
     }
 
     private func drop(attentionId: String) {
         pendingIds.remove(attentionId)
-        dismissBanner(attentionId)
+        pendingOrder.removeAll { $0 == attentionId }
+        hideBanner(attentionId)
         refreshBadge()
+        removeWindowNotification(attentionId)
     }
 
     private func showBanner(attentionId: String, title: String, body: String) {
-        dismissBanner(attentionId)
+        hideBanner(attentionId)
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 76),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -121,6 +136,7 @@ final class ShuttleAttention: NSObject {
         panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.becomesKeyOnlyIfNeeded = true
+        panel.identifier = NSUserInterfaceItemIdentifier(attentionId)
 
         let view = AttentionBannerView(frame: NSRect(x: 0, y: 0, width: 360, height: 76))
         view.titleText = title
@@ -137,22 +153,9 @@ final class ShuttleAttention: NSObject {
         banners[attentionId] = panel
         layoutBanners()
         panel.orderFrontRegardless()
-        scheduleBannerDismiss(attentionId: attentionId)
     }
 
-    private func scheduleBannerDismiss(attentionId: String) {
-        bannerDismissWork[attentionId]?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.bannerDismissWork[attentionId] = nil
-            self?.dismissBanner(attentionId)
-        }
-        bannerDismissWork[attentionId] = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
-    }
-
-    private func dismissBanner(_ attentionId: String) {
-        bannerDismissWork[attentionId]?.cancel()
-        bannerDismissWork[attentionId] = nil
+    private func hideBanner(_ attentionId: String) {
         banners.removeValue(forKey: attentionId)?.orderOut(nil)
         layoutBanners()
     }
@@ -160,11 +163,13 @@ final class ShuttleAttention: NSObject {
     private func layoutBanners() {
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         var y = screen.maxY - 16
-        for panel in banners.values {
+        for id in pendingOrder.reversed() {
+            guard let panel = banners[id] else { continue }
             let size = panel.frame.size
             y -= size.height
             panel.setFrameOrigin(NSPoint(x: screen.maxX - size.width - 16, y: y))
-            y -= 8
+            panel.orderFrontRegardless()
+            y -= 10
         }
     }
 
@@ -176,6 +181,70 @@ final class ShuttleAttention: NSObject {
             if #available(macOS 13.0, *) {
                 UNUserNotificationCenter.current().setBadgeCount(count, withCompletionHandler: { _ in })
             }
+        }
+    }
+
+    private func notificationIdentifier(_ attentionId: String) -> String {
+        "shuttleterm.window.\(attentionId)"
+    }
+
+    private func postWindowNotification(attentionId: String, title: String, body: String) {
+        let count = pendingIds.count
+        let identifier = notificationIdentifier(attentionId)
+        notifyQueue.async {
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.badge = NSNumber(value: count)
+            content.sound = nil
+            content.threadIdentifier = attentionId
+            if #available(macOS 12.0, *) {
+                content.interruptionLevel = .passive
+            }
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(request, withCompletionHandler: { _ in })
+        }
+    }
+
+    private func removeWindowNotification(_ attentionId: String) {
+        let identifier = notificationIdentifier(attentionId)
+        let count = pendingIds.count
+        notifyQueue.async {
+            let center = UNUserNotificationCenter.current()
+            center.removeDeliveredNotifications(withIdentifiers: [identifier])
+            center.removePendingNotificationRequests(withIdentifiers: [identifier])
+            if #available(macOS 13.0, *) {
+                center.setBadgeCount(count, withCompletionHandler: { _ in })
+            }
+        }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let identifier = response.notification.request.identifier
+        let prefix = "shuttleterm.window."
+        let attentionId = identifier.hasPrefix(prefix)
+            ? String(identifier.dropFirst(prefix.count))
+            : identifier
+        onMain {
+            if let session = ShuttleTerminalController.shared.session(attentionId: attentionId) {
+                session.makeKeyAndOrderFront()
+                self.clear(session)
+            } else {
+                self.drop(attentionId: attentionId)
+            }
+            completionHandler()
         }
     }
 
