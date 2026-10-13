@@ -1288,13 +1288,9 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         if edgePad > 0, let holder = terminal.superview, let cellH = terminal.cellDimension?.height, cellH > 1 {
             let holderH = holder.bounds.height
             if holderH > 1 {
-                let available = max(0, holderH - 2 * edgePad)
-                let leftover = available - floor(available / cellH) * cellH
-                if leftover >= 1 {
-                    let extraTop = floor(leftover / 2)
-                    top = edgePad + extraTop
-                    bottom = edgePad + (leftover - extraTop)
-                }
+                let pads = verticalCellPadding(holderHeight: holderH, cellHeight: cellH)
+                top = pads.top
+                bottom = pads.bottom
             }
         }
         let padsChanged = terminalPadTop.constant != top
@@ -1314,6 +1310,16 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         }
     }
 
+    /// Fit as many rows as possible. Keep a 12pt gap when that does not cost a
+    /// line; shrink toward 4pt when 12pt would leave a blank row of space.
+    private func verticalCellPadding(holderHeight: CGFloat, cellHeight: CGFloat) -> (top: CGFloat, bottom: CGFloat) {
+        let minPad = min(4, edgePad)
+        let rows = max(0, floor((holderHeight - 2 * minPad) / cellHeight))
+        let remainder = max(0, holderHeight - rows * cellHeight)
+        let top = floor(remainder / 2)
+        return (top, remainder - top)
+    }
+
     private func snapWindowHeightToCells() {
         guard !isSnappingPad else { return }
         guard edgePad > 0 else { return }
@@ -1324,16 +1330,16 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         let cellH = terminal.cellDimension.height
         let holderH = holder.bounds.height
         guard cellH > 1, holderH > 1 else { return }
-        let available = max(0, holderH - 2 * edgePad)
-        let leftover = available - floor(available / cellH) * cellH
-        guard leftover >= 1 else { return }
-        let newHeight = window.frame.size.height - leftover
+        let pads = verticalCellPadding(holderHeight: holderH, cellHeight: cellH)
+        let extra = (pads.top + pads.bottom) - 2 * edgePad
+        guard extra >= 1 else { return }
+        let newHeight = window.frame.size.height - extra
         guard newHeight >= window.minSize.height else { return }
         isSnappingPad = true
         defer { isSnappingPad = false }
         var frame = window.frame
         frame.size.height = newHeight
-        frame.origin.y += leftover
+        frame.origin.y += extra
         window.setFrame(frame, display: true, animate: false)
     }
 
