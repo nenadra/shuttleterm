@@ -114,9 +114,30 @@ final class ShuttleTermView: LocalProcessTerminalView {
         onHostOutput?(slice)
     }
 
+    /// Drop the trailing colon SwiftTerm puts on XTVERSION (`SwiftTerm …:`).
+    /// Grok's TUI treats that leftover `:` as composer text.
+    override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        super.send(source: source, data: Self.xtversionWithoutTrailingColon(Array(data))[...])
+    }
+
     override func send(source: TerminalView, data: ArraySlice<UInt8>) {
         onUserInput?(data)
         super.send(source: source, data: data)
+    }
+
+    private static func xtversionWithoutTrailingColon(_ bytes: [UInt8]) -> [UInt8] {
+        guard bytes.count >= 7,
+              bytes[0] == 0x1b, bytes[1] == 0x50, bytes[2] == 0x3e, bytes[3] == 0x7c,
+              bytes[bytes.count - 2] == 0x1b, bytes[bytes.count - 1] == 0x5c
+        else {
+            return bytes
+        }
+        let text = bytes[4 ..< (bytes.count - 2)]
+        guard text.last == 0x3a else { return bytes }
+        var out = Array(bytes[0..<4])
+        out.append(contentsOf: text.dropLast())
+        out.append(contentsOf: [0x1b, 0x5c])
+        return out
     }
 
     override func keyDown(with event: NSEvent) {

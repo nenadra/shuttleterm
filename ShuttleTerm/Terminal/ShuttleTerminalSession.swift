@@ -1178,8 +1178,10 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
             next = ShuttleGrokResume.bindGrokToExactCwd(next, cwd: grokWorkingDirectory(for: next))
             markGrokLaunch(sent: true)
         }
+        rewritingInput = true
         terminal.send(txt: next)
         terminal.send([0x0d])
+        rewritingInput = false
         if ShuttleGrokResume.isAgentInvocation(next) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
                 ShuttleTerminalController.shared.schedulePersist()
