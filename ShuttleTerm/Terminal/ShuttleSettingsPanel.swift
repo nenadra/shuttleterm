@@ -20,6 +20,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
     private var themePopup: NSPopUpButton!
     private var fontPopup: NSPopUpButton!
     private var alignGridPopup: NSPopUpButton!
+    private var displaySizePopup: NSPopUpButton!
     private var hostTable: NSTableView!
     private var hostPlaceholder: NSTextField!
     private var minusButton: NSButton!
@@ -39,6 +40,13 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         guard let window, window.isVisible else { return }
         applyWindowLevel()
         window.orderFrontRegardless()
+    }
+
+    @objc func syncDisplaySizeControl() {
+        guard window != nil else { return }
+        displaySizePopup.selectItem(
+            withTitle: displaySizeTitle(ShuttleTerminalController.shared.displaySize)
+        )
     }
 
     @objc func show() {
@@ -79,7 +87,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
 
     private func buildWindow() {
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 730),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 770),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -119,6 +127,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         themePopup = popup(ShuttleTerminalTheme.paletteNames, #selector(changed))
         fontPopup = popup(ShuttleTerminalTheme.installedFontNames(), #selector(changed))
         alignGridPopup = popup(["5 × 4", "4 × 3"], #selector(changed))
+        displaySizePopup = popup(["Full", "Left half", "Right half"], #selector(changed))
 
         stack.addArrangedSubview(launchCheckbox)
         stack.addArrangedSubview(titlebarCheckbox)
@@ -133,6 +142,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         stack.addArrangedSubview(labeled("Default theme", themePopup))
         stack.addArrangedSubview(labeled("Default font", fontPopup))
         stack.addArrangedSubview(labeled("Align grid", alignGridPopup))
+        stack.addArrangedSubview(labeled("App display size", displaySizePopup))
 
         let hostsHeader = NSTextField(labelWithString: "Hosts")
         hostsHeader.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
@@ -272,6 +282,8 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         } else if isPopup(alignGridPopup, sender: sender) {
             let grid = alignGridPopup.titleOfSelectedItem == "4 × 3" ? "4x3" : "5x4"
             ShuttleTerminalController.shared.applyAlignGrid(grid)
+        } else if isPopup(displaySizePopup, sender: sender) {
+            ShuttleTerminalController.shared.applyDisplaySize(displaySizeValue())
         }
     }
 
@@ -476,6 +488,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
             restoreCheckbox.state = .on
             lockCheckbox.state = .off
             alignGridPopup.selectItem(withTitle: "5 × 4")
+            displaySizePopup.selectItem(withTitle: "Full")
             return
         }
         launchCheckbox.state = bool(json["launch_at_login"], fallback: launchAtLogin.launchAtLogin) ? .on : .off
@@ -493,6 +506,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         }
         let grid = (json["align_grid"] as? String)?.lowercased() ?? "5x4"
         alignGridPopup.selectItem(withTitle: grid == "4x3" ? "4 × 3" : "5 × 4")
+        displaySizePopup.selectItem(withTitle: displaySizeTitle(json["display_size"] as? String))
     }
 
     private func saveToJSON() {
@@ -506,6 +520,7 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         json["default_theme"] = themePopup.titleOfSelectedItem ?? "Pro"
         json["default_font"] = fontPopup.titleOfSelectedItem ?? "Menlo"
         json["align_grid"] = alignGridPopup.titleOfSelectedItem == "4 × 3" ? "4x3" : "5x4"
+        json["display_size"] = displaySizeValue()
         json.removeObject(forKey: "terminal")
         json.removeObject(forKey: "iTerm_version")
         ShuttleHostStore.saveJSON(json)
@@ -530,6 +545,22 @@ final class ShuttleSettingsPanel: NSObject, NSTableViewDataSource, NSTableViewDe
         if let flag = value as? Bool { return flag }
         if let number = value as? NSNumber { return number.boolValue }
         return fallback
+    }
+
+    private func displaySizeValue() -> String {
+        switch displaySizePopup.titleOfSelectedItem {
+        case "Left half": return "left"
+        case "Right half": return "right"
+        default: return "full"
+        }
+    }
+
+    private func displaySizeTitle(_ value: String?) -> String {
+        switch ShuttleWindowChrome.normalizedDisplaySize(value) {
+        case "left": return "Left half"
+        case "right": return "Right half"
+        default: return "Full"
+        }
     }
 }
 
@@ -589,6 +620,7 @@ enum ShuttleHostStore {
             "restore_windows": true,
             "lock_after_sleep": false,
             "align_grid": "5x4",
+            "display_size": "full",
             "hosts": []
         ]
         if let data = try? JSONSerialization.data(withJSONObject: skeleton, options: [.prettyPrinted, .sortedKeys]) {

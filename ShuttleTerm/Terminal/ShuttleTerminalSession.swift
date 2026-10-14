@@ -13,6 +13,8 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     let reuseKey: String
     let reconnect: Bool
     let attentionId = UUID().uuidString
+    var layoutFrame: NSRect?
+    var workspaceParked = false
 
     private let terminal: ShuttleTermView
     private var theme: ShuttleTerminalTheme
@@ -78,6 +80,9 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     private var commandPeeking = false
     private var chromeShowWork: DispatchWorkItem?
     private static let chromeShowDelay: TimeInterval = 0.05
+    private var agentSeenBusyTitle = false
+    private var agentTitleBusy = false
+    private var attentionDismissed = false
 
     var isRunning: Bool { running }
     var themeName: String { theme.name }
@@ -85,6 +90,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     var attentionTitle: String { hostTitle }
     var attentionBody: String { "Action required" }
     var isRestoring: Bool { restoring }
+    var suppressesAttention: Bool { pointerInside || attentionDismissed }
     var reportsBellAsAttention: Bool {
         if terminal.getTerminal().isCurrentBufferAlternate {
             return true
@@ -99,6 +105,48 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
             return true
         }
         return false
+    }
+
+    func markAttentionDismissed() {
+        attentionDismissed = true
+    }
+
+    func applyHalfDisplayWindowLock(_ locked: Bool) {
+        var mask = window.styleMask
+        if locked {
+            mask.remove([.resizable, .miniaturizable])
+            window.styleMask = mask
+            window.collectionBehavior = [.managed, .fullScreenNone]
+            let size = layoutFrame?.size
+                ?? ShuttleTerminalController.shared.gridCellSize(on: window.screen)
+            let lockedSize = NSSize(width: max(size.width, 1), height: max(size.height, 1))
+            window.minSize = lockedSize
+            window.maxSize = lockedSize
+            if window.isVisible, !window.isMiniaturized {
+                let current = window.frame.size
+                if abs(current.width - lockedSize.width) > 0.5
+                    || abs(current.height - lockedSize.height) > 0.5 {
+                    var frame = window.frame
+                    frame.size = lockedSize
+                    window.setFrame(frame, display: true, animate: false)
+                }
+            }
+        } else {
+            mask.insert([.resizable, .miniaturizable])
+            window.styleMask = mask
+            window.collectionBehavior = [.managed, .fullScreenPrimary]
+            window.minSize = NSSize(width: 360, height: 180)
+            window.maxSize = NSSize(width: 20_000, height: 20_000)
+        }
+        applyTrafficLightVisibility()
+        applyWindowChrome(force: true)
+    }
+
+    private func applyTrafficLightVisibility() {
+        let hideExtras = ShuttleWindowChrome.usesHalfDisplay
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = hideExtras
+        window.standardWindowButton(.zoomButton)?.isHidden = hideExtras
+        window.standardWindowButton(.closeButton)?.isHidden = false
     }
 
     init(
@@ -138,6 +186,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         )
         window.title = title
         window.minSize = NSSize(width: 360, height: 180)
+        window.maxSize = NSSize(width: 20_000, height: 20_000)
         window.tabbingMode = .disallowed
         window.tabbingIdentifier = ""
         window.collectionBehavior = [.managed, .fullScreenPrimary]
@@ -186,6 +235,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         lockTitle()
         applyWindowChrome(force: true)
         applyFocusAppearance()
+        reportTerminalFocus()
         installMouseMonitor()
         if let restoreFrame {
             window.setFrame(Self.clampedFrame(restoreFrame), display: false)
@@ -219,10 +269,12 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         } else {
             NSApp.activate(ignoringOtherApps: true)
         }
+        ShuttleTerminalController.shared.revealInWorkspace(self)
         window.makeKeyAndOrderFront(nil)
         window.layoutIfNeeded()
         terminal.layoutSubtreeIfNeeded()
         alignTerminalPaddingToCells(layoutNow: true)
+        reportTerminalFocus()
         restoreReady = true
         flushRestoredBufferIfNeeded()
         if ShuttleAppLock.shared.isLocked {
@@ -235,16 +287,33 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     func tile(in frame: NSRect, reveal: Bool = true) {
         window.tabbingMode = .disallowed
         let previousMin = window.minSize
-        let allowed = NSSize(
+        let previousMax = window.maxSize
+        let allowedMin = NSSize(
             width: min(previousMin.width, max(1, frame.width)),
             height: min(previousMin.height, max(1, frame.height))
         )
-        if allowed.width < previousMin.width || allowed.height < previousMin.height {
-            window.minSize = allowed
+        let allowedMax = NSSize(
+            width: max(previousMax.width, frame.width),
+            height: max(previousMax.height, frame.height)
+        )
+        if allowedMin.width < previousMin.width || allowedMin.height < previousMin.height {
+            window.minSize = allowedMin
+        }
+        if allowedMax.width > previousMax.width || allowedMax.height > previousMax.height {
+            window.maxSize = allowedMax
         }
         window.setFrame(frame, display: true, animate: false)
-        if window.minSize != previousMin {
-            window.minSize = previousMin
+        if ShuttleWindowChrome.usesHalfDisplay {
+            let lockedSize = NSSize(width: max(frame.width, 1), height: max(frame.height, 1))
+            window.minSize = lockedSize
+            window.maxSize = lockedSize
+        } else {
+            if window.minSize != previousMin {
+                window.minSize = previousMin
+            }
+            if window.maxSize != previousMax {
+                window.maxSize = previousMax
+            }
         }
         window.contentView?.layoutSubtreeIfNeeded()
         terminal.needsLayout = true
@@ -311,6 +380,9 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
 
     func mouseEnteredWindow() {
         if appLocked { return }
+        pointerInside = true
+        attentionDismissed = true
+        ShuttleAttention.shared.clear(self)
         if ShuttleTerminalController.shared.focusOnHover, NSApp.isActive {
             window.makeKey()
             if !findVisible {
@@ -467,10 +539,12 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        attentionDismissed = true
         ShuttleAttention.shared.clear(self)
         ShuttleTerminalController.shared.sessionDidBecomeKey(self)
         applyFocusAppearance()
         applyCaretStyle()
+        reportTerminalFocus()
         if ShuttleAppLock.shared.isLocked {
             window.makeFirstResponder(lockOverlay)
             return
@@ -492,9 +566,15 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         }
         applyCaretStyle()
         applyFocusAppearance()
+        reportTerminalFocus()
+        raiseAttentionIfWaitingInBackground()
     }
 
     func windowDidMove(_ notification: Notification) {
+        if !chromeDragActive, !ShuttleTerminalController.shared.isApplyingWorkspaceLayout {
+            ShuttleWindowChrome.constrain(window, magnetic: false)
+            ShuttleTerminalController.shared.syncLayoutFrame(self)
+        }
         ShuttleTerminalController.shared.schedulePersist()
     }
 
@@ -503,16 +583,35 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
             flushRestoredBufferIfNeeded()
         }
         if !chromeDragActive {
-            ShuttleTerminalController.shared.rememberWindowSize(window.frame.size)
+            if !ShuttleWindowChrome.usesHalfDisplay {
+                ShuttleTerminalController.shared.rememberWindowSize(window.frame.size)
+            }
             applyFocusAppearance()
         }
         ShuttleTerminalController.shared.schedulePersist()
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
+        if ShuttleWindowChrome.usesHalfDisplay { return }
+        ShuttleWindowChrome.constrain(window, magnetic: false)
         alignTerminalPaddingToCells(layoutNow: true)
         snapWindowHeightToCells()
         alignTerminalPaddingToCells(layoutNow: true)
+    }
+
+    func windowShouldMiniaturize(_ sender: NSWindow) -> Bool {
+        !ShuttleWindowChrome.usesHalfDisplay
+    }
+
+    func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool {
+        !ShuttleWindowChrome.usesHalfDisplay
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        if ShuttleWindowChrome.usesHalfDisplay {
+            return sender.frame.size
+        }
+        return frameSize
     }
 
     func windowDidEnterFullScreen(_ notification: Notification) {
@@ -530,6 +629,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
         postedTitle = title
         lockTitle()
+        considerTitleAttention(title)
     }
 
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
@@ -543,7 +643,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     }
 
     func notify(source: LocalProcessTerminalView, title: String, body: String) {
-        ShuttleAttention.shared.noteNotify(from: self)
+        ShuttleAttention.shared.noteNotify(from: self, title: title, body: body)
     }
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
@@ -1333,6 +1433,7 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         let pads = verticalCellPadding(holderHeight: holderH, cellHeight: cellH)
         let extra = (pads.top + pads.bottom) - 2 * edgePad
         guard extra >= 1 else { return }
+        guard !ShuttleWindowChrome.usesHalfDisplay else { return }
         let newHeight = window.frame.size.height - extra
         guard newHeight >= window.minSize.height else { return }
         isSnappingPad = true
@@ -1424,6 +1525,49 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
             parts.append(pretty)
         }
         window.subtitle = parts.joined(separator: " — ")
+    }
+
+    private func reportTerminalFocus() {
+        terminal.getTerminal().setTerminalFocus(window.isKeyWindow && NSApp.isActive)
+    }
+
+    private func considerTitleAttention(_ title: String) {
+        guard reportsBellAsAttention, !isRestoring else { return }
+        let busy = Self.titleLooksBusy(title)
+        let action = Self.titleNeedsAttention(title)
+        if busy {
+            agentSeenBusyTitle = true
+        }
+        let becameIdle = agentTitleBusy && !busy
+        agentTitleBusy = busy
+        if !busy && !action {
+            attentionDismissed = false
+        }
+        if action || becameIdle {
+            ShuttleAttention.shared.noteNotify(from: self)
+        }
+    }
+
+    private func raiseAttentionIfWaitingInBackground() {
+        guard reportsBellAsAttention, !isRestoring, !suppressesAttention else { return }
+        if Self.titleNeedsAttention(postedTitle) || (agentSeenBusyTitle && !agentTitleBusy) {
+            ShuttleAttention.shared.noteBackgroundWait(from: self)
+        }
+    }
+
+    private static func titleNeedsAttention(_ title: String) -> Bool {
+        title.range(of: "Action Required", options: .caseInsensitive) != nil
+    }
+
+    private static func titleLooksBusy(_ title: String) -> Bool {
+        if titleNeedsAttention(title) {
+            return true
+        }
+        if title.unicodeScalars.contains(where: { (0x2800...0x28FF).contains($0.value) }) {
+            return true
+        }
+        let markers = ["Thinking", "Responding", "Waiting", "Running", "Compacting", "Retrying"]
+        return markers.contains { title.contains($0) }
     }
 
     private func prettyDirectory() -> String? {
@@ -1657,8 +1801,9 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
             guard let button = window.standardWindowButton(type) else { continue }
             button.animations = ["alphaValue": NSNull()]
             button.layer?.removeAllAnimations()
-            button.isHidden = false
-            button.alphaValue = alpha
+            let hide = ShuttleWindowChrome.usesHalfDisplay && type != .closeButton
+            button.isHidden = hide
+            button.alphaValue = hide ? 0 : alpha
             if let group = button.superview {
                 group.animations = ["alphaValue": NSNull(), "hidden": NSNull()]
                 group.layer?.removeAllAnimations()
@@ -1681,9 +1826,13 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         terminal.selection.active = false
         terminal.setNeedsDisplay(terminal.bounds)
         pinChromeAppearance()
-        ShuttleWindowChrome.animateSnapForDrag(window)
-        if chromeDragActive, NSEvent.pressedMouseButtons & 1 != 0 {
-            window.performDrag(with: Self.mouseDownEvent(for: window, from: event))
+        if ShuttleWindowChrome.usesHalfDisplay {
+            ShuttleWindowChrome.trackDrag(window)
+        } else {
+            ShuttleWindowChrome.animateSnapForDrag(window)
+            if chromeDragActive, NSEvent.pressedMouseButtons & 1 != 0 {
+                window.performDrag(with: Self.mouseDownEvent(for: window, from: event))
+            }
         }
         finishChromeDrag()
     }
@@ -1692,7 +1841,10 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         guard chromeDragActive else { return }
         chromeDragActive = false
         terminal.setChromeDragActive(false)
-        ShuttleTerminalController.shared.rememberWindowSize(window.frame.size)
+        ShuttleWindowChrome.constrain(window, magnetic: ShuttleWindowChrome.usesHalfDisplay)
+        if !ShuttleWindowChrome.usesHalfDisplay {
+            ShuttleTerminalController.shared.rememberWindowSize(window.frame.size)
+        }
         applyFocusAppearance()
         handleMonitoredMouse()
     }
@@ -1885,12 +2037,11 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
     }
 
     private static func clampedFrame(_ frame: NSRect) -> NSRect {
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main
+        let vis = ShuttleWindowChrome.workspace(on: screen)
         var f = frame
-        let screens = NSScreen.screens.map(\.visibleFrame)
-        let vis = screens.first(where: { $0.intersects(f) }) ?? NSScreen.main?.visibleFrame
-        guard let vis else { return f }
-        f.size.width = min(max(f.width, 360), vis.width)
-        f.size.height = min(max(f.height, 180), vis.height)
+        f.size.width = min(max(f.width, min(360, vis.width)), vis.width)
+        f.size.height = min(max(f.height, min(180, vis.height)), vis.height)
         if f.maxX > vis.maxX { f.origin.x = vis.maxX - f.width }
         if f.minX < vis.minX { f.origin.x = vis.minX }
         if f.maxY > vis.maxY { f.origin.y = vis.maxY - f.height }
@@ -1931,8 +2082,9 @@ final class ShuttleTerminalSession: NSObject, NSWindowDelegate, LocalProcessTerm
         for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
             guard let button = window.standardWindowButton(type) else { continue }
             button.layer?.removeAllAnimations()
-            button.isHidden = false
-            button.alphaValue = 1
+            let hide = ShuttleWindowChrome.usesHalfDisplay && type != .closeButton
+            button.isHidden = hide
+            button.alphaValue = hide ? 0 : 1
         }
     }
 
@@ -2035,9 +2187,106 @@ enum ShuttleWindowChrome {
     static let snapWidthFraction: CGFloat = 0.33
     static let snapHeightFraction: CGFloat = 0.285
     static let snapDuration: TimeInterval = 0.22
+    private static let edgeSnap: CGFloat = 28
+
+    static func normalizedDisplaySize(_ value: String?) -> String {
+        switch value?.lowercased() {
+        case "left", "left half", "left_half", "lefthalf":
+            return "left"
+        case "right", "right half", "right_half", "righthalf":
+            return "right"
+        default:
+            return "full"
+        }
+    }
+
+    static var usesHalfDisplay: Bool {
+        let size = normalizedDisplaySize(ShuttleTerminalController.shared.displaySize)
+        return size == "left" || size == "right"
+    }
+
+    static func workspace(on screen: NSScreen?) -> NSRect {
+        let vis = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        return workspace(in: vis)
+    }
+
+    static func workspace(for window: NSWindow) -> NSRect {
+        workspace(on: window.screen ?? screen(for: NSEvent.mouseLocation, window: window))
+    }
+
+    static func workspace(in vis: NSRect) -> NSRect {
+        let half = vis.width / 2
+        switch normalizedDisplaySize(ShuttleTerminalController.shared.displaySize) {
+        case "left":
+            return NSRect(x: vis.minX, y: vis.minY, width: half, height: vis.height)
+        case "right":
+            return NSRect(x: vis.minX + half, y: vis.minY, width: vis.width - half, height: vis.height)
+        default:
+            return vis
+        }
+    }
+
+    /// Strip used to size and place windows in half mode. Wider than the visible
+    /// half so extra columns sit off the outer edge and can be scrolled in.
+    static func layoutBounds(on screen: NSScreen?) -> NSRect {
+        let vis = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        return layoutBounds(in: vis)
+    }
+
+    static func layoutBounds(in vis: NSRect) -> NSRect {
+        let view = workspace(in: vis)
+        guard usesHalfDisplay else { return view }
+        if normalizedDisplaySize(ShuttleTerminalController.shared.displaySize) == "left" {
+            return NSRect(x: view.maxX - vis.width, y: view.minY, width: vis.width, height: view.height)
+        }
+        return NSRect(x: view.minX, y: view.minY, width: vis.width, height: view.height)
+    }
+
+    static func frameCrossesInnerEdge(_ frame: NSRect, viewport: NSRect) -> Bool {
+        switch normalizedDisplaySize(ShuttleTerminalController.shared.displaySize) {
+        case "left":
+            return frame.maxX > viewport.maxX + 1
+        case "right":
+            return frame.minX < viewport.minX - 1
+        default:
+            return false
+        }
+    }
+
+    /// True when a window should be on-screen in half mode: it overlaps the
+    /// visible half and does not spill into the other half. Overflow stays
+    /// hidden until a swipe brings it in from the outer edge.
+    static func carouselShows(_ frame: NSRect, in viewport: NSRect) -> Bool {
+        let overlaps = frame.maxX > viewport.minX + 1 && frame.minX < viewport.maxX - 1
+        return overlaps && !frameCrossesInnerEdge(frame, viewport: viewport)
+    }
+
+    @discardableResult
+    static func constrain(_ window: NSWindow, magnetic: Bool) -> Bool {
+        let vis = workspace(for: window)
+        let fitted = fittedFrame(window.frame, into: vis, minSize: window.minSize, magnetic: magnetic)
+        guard fitted != window.frame else { return false }
+        window.setFrame(fitted, display: true, animate: false)
+        return true
+    }
 
     static func snapForDrag(_ window: NSWindow) {
         animateSnapForDrag(window)
+    }
+
+    static func trackDrag(_ window: NSWindow) {
+        let start = window.frame
+        let startMouse = NSEvent.mouseLocation
+        let relX = start.width > 1 ? (startMouse.x - start.minX) / start.width : 0.5
+        let relY = start.height > 1 ? (startMouse.y - start.minY) / start.height : 0.85
+        while NSEvent.pressedMouseButtons & 1 != 0 {
+            applyDragFrame(window, width: window.frame.width, height: window.frame.height, relX: relX, relY: relY)
+            RunLoop.current.run(mode: .eventTracking, before: Date(timeIntervalSinceNow: 1.0 / 60.0))
+        }
     }
 
     static func animateSnapForDrag(_ window: NSWindow, onTick: (() -> Void)? = nil) {
@@ -2075,14 +2324,14 @@ enum ShuttleWindowChrome {
 
     private static func snapTarget(for window: NSWindow) -> NSSize? {
         guard let screen = screen(for: NSEvent.mouseLocation, window: window) else { return nil }
-        let vis = screen.visibleFrame
+        let vis = workspace(on: screen)
         let width = max(window.minSize.width, vis.width * snapWidthFraction)
         let height = max(window.minSize.height, vis.height * snapHeightFraction)
         let old = window.frame
         if old.width <= width || old.height <= height {
             return nil
         }
-        return NSSize(width: width, height: height)
+        return NSSize(width: min(width, vis.width), height: min(height, vis.height))
     }
 
     private static func applyDragFrame(
@@ -2099,14 +2348,32 @@ enum ShuttleWindowChrome {
             width: width,
             height: height
         )
-        if let vis = screen(for: mouse, window: window)?.visibleFrame {
-            if frame.maxX > vis.maxX { frame.origin.x = vis.maxX - frame.width }
-            if frame.minX < vis.minX { frame.origin.x = vis.minX }
-            if frame.maxY > vis.maxY { frame.origin.y = vis.maxY - frame.height }
-            if frame.minY < vis.minY { frame.origin.y = vis.minY }
-        }
+        let vis = workspace(on: screen(for: mouse, window: window))
+        frame = fittedFrame(frame, into: vis, minSize: window.minSize, magnetic: usesHalfDisplay)
         setFrameWithoutImplicitAnimation(window, frame)
         window.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    private static func fittedFrame(
+        _ frame: NSRect,
+        into vis: NSRect,
+        minSize: NSSize,
+        magnetic: Bool
+    ) -> NSRect {
+        var f = frame
+        f.size.width = min(max(f.width, min(minSize.width, vis.width)), vis.width)
+        f.size.height = min(max(f.height, min(minSize.height, vis.height)), vis.height)
+        if f.maxX > vis.maxX { f.origin.x = vis.maxX - f.width }
+        if f.minX < vis.minX { f.origin.x = vis.minX }
+        if f.maxY > vis.maxY { f.origin.y = vis.maxY - f.height }
+        if f.minY < vis.minY { f.origin.y = vis.minY }
+        if magnetic {
+            if abs(f.minX - vis.minX) <= edgeSnap { f.origin.x = vis.minX }
+            if abs(f.maxX - vis.maxX) <= edgeSnap { f.origin.x = vis.maxX - f.width }
+            if abs(f.minY - vis.minY) <= edgeSnap { f.origin.y = vis.minY }
+            if abs(f.maxY - vis.maxY) <= edgeSnap { f.origin.y = vis.maxY - f.height }
+        }
+        return f
     }
 
     private static func setFrameWithoutImplicitAnimation(_ window: NSWindow, _ frame: NSRect) {

@@ -94,6 +94,7 @@
     }
     [self hideAutomaticMenuImages:menu];
     [[ShuttleTerminalController shared] refreshSplitMenus];
+    [[ShuttleTerminalController shared] refreshDisplaySizeMenus];
 }
 
 - (void) loadMenu {
@@ -153,6 +154,14 @@
     [ShuttleAppLock shared].isEnabled = lockAfterSleep;
     NSString *alignGrid = [json[@"align_grid"] lowercaseString];
     [ShuttleTerminalController shared].alignGrid = [alignGrid isEqualToString:@"4x3"] ? @"4x3" : @"5x4";
+    NSString *displaySize = [json[@"display_size"] lowercaseString];
+    if ([displaySize isEqualToString:@"left"] || [displaySize isEqualToString:@"left_half"]) {
+        [ShuttleTerminalController shared].displaySize = @"left";
+    } else if ([displaySize isEqualToString:@"right"] || [displaySize isEqualToString:@"right_half"]) {
+        [ShuttleTerminalController shared].displaySize = @"right";
+    } else {
+        [ShuttleTerminalController shared].displaySize = @"full";
+    }
     [self refreshSettingsToggles];
     shuttleHosts = json[@"hosts"];
 
@@ -299,15 +308,20 @@
                                                keyEquivalent:@""];
     alignRoot.submenu = alignMenu;
     alignRoot.tag = 9011;
-    [menu insertItem:alignRoot atIndex:insertAt];
+    [menu insertItem:alignRoot atIndex:insertAt++];
+
+    NSMenu *displayMenu = [[NSMenu alloc] initWithTitle:NSLocalizedString(@"App Display Size", nil)];
+    [[ShuttleTerminalController shared] attachMenubarDisplaySizeMenu:displayMenu];
+    NSMenuItem *displayRoot = [[NSMenuItem alloc] initWithTitle:NSLocalizedString(@"App Display Size", nil)
+                                                        action:nil
+                                                 keyEquivalent:@""];
+    displayRoot.submenu = displayMenu;
+    displayRoot.tag = 9012;
+    [menu insertItem:displayRoot atIndex:insertAt];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    ShuttleAttention *attention = [ShuttleAttention shared];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        [attention prepare];
-    });
+    [[ShuttleAttention shared] prepare];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
@@ -529,6 +543,7 @@
         if ([title isEqualToString:@"Run Command…"] ||
             [title isEqualToString:@"Split"] ||
             [title isEqualToString:@"Align"] ||
+            [title isEqualToString:@"App Display Size"] ||
             [title isEqualToString:@"Settings"] ||
             [title isEqualToString:@"Settings…"] ||
             [title isEqualToString:@"Help"] ||
@@ -634,6 +649,7 @@
             @"restore_windows": @YES,
             @"lock_after_sleep": @NO,
             @"align_grid": @"5x4",
+            @"display_size": @"full",
             @"hosts": @[]
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:skeleton options:NSJSONWritingPrettyPrinted error:nil];

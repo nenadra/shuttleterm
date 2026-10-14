@@ -20,7 +20,10 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     private var helpWindow: NSWindow?
     private weak var splitMenu: NSMenu?
     private weak var menubarSplitMenu: NSMenu?
+    private weak var displaySizeMenu: NSMenu?
+    private weak var menubarDisplaySizeMenu: NSMenu?
     private var spaceRestackWork: DispatchWorkItem?
+    private var scrollMonitor: Any?
 
     private override init() {
         super.init()
@@ -30,6 +33,9 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .swipe]) { [weak self] event in
+            self?.handleWorkspaceScroll(event) ?? event
+        }
     }
 
     @objc private func activeSpaceDidChange(_ notification: Notification) {
@@ -86,6 +92,22 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     @objc var restoreWindows = true
     /// `"5x4"` or `"4x3"`. Controls how many align cells fit on an edge.
     @objc var alignGrid = "5x4"
+    /// `"full"`, `"left"`, or `"right"`. Limits windows to that part of the screen.
+    @objc var displaySize = "full"
+    private var workspacePan: CGFloat = 0
+    private var workspacePanning = false
+    private var workspaceLayoutActive = false
+    private var panSnapWork: DispatchWorkItem?
+    private var panGestureOrigin: CGFloat?
+    private var panAnimTimer: Timer?
+    private var panAnimStart: CGFloat = 0
+    private var panAnimTarget: CGFloat = 0
+    private var panAnimStartTime: TimeInterval = 0
+    private var pageDotsPanel: NSPanel?
+    private var pageDotsView: WorkspacePageDotsView?
+    private var pageDotsHideWork: DispatchWorkItem?
+    private var pageDotsHovered = false
+    var isApplyingWorkspaceLayout: Bool { workspaceLayoutActive || workspacePanning }
     private var lastLayout: LastLayout?
     private var lastAlignEdge: AlignEdge?
     private var persistWork: DispatchWorkItem?
@@ -144,6 +166,9 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         )
         sessions.append(session)
         cascade(session.window)
+        if ShuttleWindowChrome.usesHalfDisplay {
+            session.applyHalfDisplayWindowLock(true)
+        }
         session.makeKeyAndOrderFront()
         keySession = session
         refreshSplitMenus()
@@ -185,7 +210,7 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     @objc(splitIntoGridWithCount:)
     func splitIntoGrid(count: Int) {
         installMenusIfNeeded()
-        let open = sessions.filter { $0.window.isVisible }
+        let open = sessions.filter { isWorkspaceOpen($0) }
         guard !open.isEmpty else { return }
         lastLayout = .split
         let n = min(max(count, 1), min(20, open.count))
@@ -215,15 +240,660 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
 
     @objc func applyAlignGrid(_ grid: String) {
         alignGrid = grid.lowercased() == "4x3" ? "4x3" : "5x4"
-        alignWindows(lastAlignEdge ?? .right, raise: false)
+        if ShuttleWindowChrome.usesHalfDisplay {
+            switch lastLayout {
+            case .align(let edge):
+                alignWindows(edge, raise: false)
+            default:
+                resnapHalfDisplayGrid()
+            }
+            sessions.forEach { $0.applyHalfDisplayWindowLock(true) }
+        } else {
+            alignWindows(lastAlignEdge ?? .right, raise: false)
+        }
         ShuttleSettingsPanel.shared.bringToFrontIfOpen()
+    }
+
+    @objc func applyDisplaySize(_ value: String) {
+        displaySize = ShuttleWindowChrome.normalizedDisplaySize(value)
+        workspacePan = 0
+        panSnapWork?.cancel()
+        panAnimTimer?.invalidate()
+        panAnimTimer = nil
+        panGestureOrigin = nil
+        workspacePanning = false
+        if !ShuttleWindowChrome.usesHalfDisplay {
+            hidePageDots()
+            unparkWorkspaceWindows()
+            for session in sessions {
+                session.layoutFrame = nil
+                session.applyHalfDisplayWindowLock(false)
+            }
+            for session in sessions where session.window.isVisible && !session.window.isMiniaturized {
+                ShuttleWindowChrome.constrain(session.window, magnetic: false)
+            }
+        } else {
+            for session in sessions where session.window.isMiniaturized {
+                session.window.deminiaturize(nil)
+            }
+            adoptHalfDisplayFrames()
+            sessions.forEach { $0.applyHalfDisplayWindowLock(true) }
+        }
+        persistDisplaySize(displaySize)
+        refreshDisplaySizeMenus()
+        ShuttleSettingsPanel.shared.syncDisplaySizeControl()
+        schedulePersist()
+        ShuttleSettingsPanel.shared.bringToFrontIfOpen()
+    }
+
+    private func persistDisplaySize(_ value: String) {
+        let json = ShuttleHostStore.loadJSON()
+        json["display_size"] = value
+        ShuttleHostStore.saveJSON(json)
+    }
+
+    private func handleWorkspaceScroll(_ event: NSEvent) -> NSEvent? {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return event }
+        guard eventBelongsToWorkspace(event) else { return event }
+        let screen = event.window?.screen
+            ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+        guard let screen else { return event }
+
+        if event.type == .swipe {
+            let dx = event.deltaX
+            guard abs(dx) >= 0.5 else { return event }
+            goToAdjacentPage(dx > 0 ? 1 : -1, on: screen)
+            return nil
+        }
+
+        var dx = event.scrollingDeltaX
+        var dy = event.scrollingDeltaY
+        if abs(dx) < 0.2, event.modifierFlags.contains(.shift) {
+            dx = dy
+            dy = 0
+        }
+        let gestureDone = event.momentumPhase == .ended
+            || event.phase == .cancelled
+            || event.momentumPhase == .cancelled
+        let began = event.phase == .began
+        let horizontal = abs(dx) >= 0.2 && abs(dx) >= abs(dy)
+        if began {
+            panGestureOrigin = workspacePan
+        }
+        let paging = workspacePanning || horizontal
+        guard paging else {
+            return event
+        }
+        if !event.hasPreciseScrollingDeltas {
+            goToAdjacentPage(dx < 0 ? 1 : -1, on: screen)
+            return nil
+        }
+        if horizontal {
+            _ = panWindows(on: screen, dx: dx)
+        }
+        showPageDots(on: screen, linger: false)
+        if gestureDone {
+            panSnapWork?.cancel()
+            snapWorkspacePan(on: screen)
+        } else {
+            schedulePanSnap(on: screen)
+        }
+        return nil
+    }
+
+    private func eventBelongsToWorkspace(_ event: NSEvent) -> Bool {
+        if let window = event.window {
+            if window === pageDotsPanel { return true }
+            return sessions.contains(where: { $0.window === window })
+        }
+        let loc = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(loc) }) ?? NSScreen.main
+        return ShuttleWindowChrome.workspace(on: screen).contains(loc)
+    }
+
+    private func schedulePanSnap(on screen: NSScreen) {
+        panSnapWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.snapWorkspacePan(on: screen)
+        }
+        panSnapWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    @discardableResult
+    private func panWindows(on screen: NSScreen, dx: CGFloat) -> Bool {
+        panAnimTimer?.invalidate()
+        panAnimTimer = nil
+        let group = workspaceGroup(on: screen)
+        guard !group.isEmpty else { return false }
+        captureLayoutFrames(group)
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        let content = layoutUnion(group)
+        guard content.width > view.width + 1 else { return false }
+        let (lo, hi) = panRange(content: content, viewport: view)
+        let next = min(max(workspacePan + dx, lo), hi)
+        guard abs(next - workspacePan) >= 0.2 else { return false }
+        workspacePanning = true
+        workspacePan = next
+        placeWorkspaceWindows(group, viewport: view)
+        schedulePersist()
+        return true
+    }
+
+    private func snapWorkspacePan(on screen: NSScreen?) {
+        panSnapWork?.cancel()
+        panSnapWork = nil
+        defer {
+            workspacePanning = false
+            panGestureOrigin = nil
+        }
+        guard ShuttleWindowChrome.usesHalfDisplay, let screen else { return }
+        let group = workspaceGroup(on: screen)
+        guard !group.isEmpty else { return }
+        captureLayoutFrames(group)
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        let content = layoutUnion(group)
+        let stops = pageStops(content: content, viewport: view)
+        guard stops.count > 1 else {
+            placeWorkspaceWindows(group, viewport: view)
+            hidePageDots()
+            return
+        }
+        workspacePan = snappedPagePan(stops: stops)
+        workspaceLayoutActive = true
+        placeWorkspaceWindows(group, viewport: view)
+        workspaceLayoutActive = false
+        showPageDots(on: screen, linger: true)
+        schedulePersist()
+    }
+
+    private func pageStops(on screen: NSScreen) -> [CGFloat] {
+        let group = workspaceGroup(on: screen)
+        captureLayoutFrames(group)
+        return pageStops(
+            content: layoutUnion(group),
+            viewport: ShuttleWindowChrome.workspace(on: screen)
+        )
+    }
+
+    /// Left-to-right pages: index 0 shows the leftmost layout (highest pan).
+    private func pageStops(content: NSRect, viewport: NSRect) -> [CGFloat] {
+        let (lo, hi) = panRange(content: content, viewport: viewport)
+        let width = max(viewport.width, 1)
+        if hi - lo < 8 { return [lo] }
+        var stops: [CGFloat] = []
+        var pan = hi
+        while pan > lo + 8 {
+            stops.append(pan)
+            pan -= width
+        }
+        stops.append(lo)
+        return stops
+    }
+
+    private func nearestPageIndex(_ stops: [CGFloat], to pan: CGFloat? = nil) -> Int {
+        guard !stops.isEmpty else { return 0 }
+        let value = pan ?? workspacePan
+        var best = 0
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for (index, stop) in stops.enumerated() {
+            let dist = abs(stop - value)
+            if dist < bestDist {
+                bestDist = dist
+                best = index
+            }
+        }
+        return best
+    }
+
+    private func snappedPagePan(stops: [CGFloat]) -> CGFloat {
+        guard !stops.isEmpty else { return workspacePan }
+        let nearest = nearestPageIndex(stops)
+        guard let origin = panGestureOrigin else {
+            return stops[nearest]
+        }
+        let originIndex = nearestPageIndex(stops, to: origin)
+        if nearest != originIndex {
+            return stops[nearest]
+        }
+        let spacing = originIndex + 1 < stops.count
+            ? abs(stops[originIndex] - stops[originIndex + 1])
+            : abs(stops[originIndex] - (originIndex > 0 ? stops[originIndex - 1] : stops[originIndex]))
+        let commit = max(24, spacing * 0.18)
+        let traveled = workspacePan - origin
+        if traveled < -commit {
+            return stops[min(originIndex + 1, stops.count - 1)]
+        }
+        if traveled > commit {
+            return stops[max(originIndex - 1, 0)]
+        }
+        return stops[originIndex]
+    }
+
+    private func goToAdjacentPage(_ delta: Int, on screen: NSScreen) {
+        let stops = pageStops(on: screen)
+        guard stops.count > 1 else { return }
+        goToPage(nearestPageIndex(stops) + delta, on: screen)
+    }
+
+    private func goToPage(_ index: Int, on screen: NSScreen) {
+        let stops = pageStops(on: screen)
+        guard !stops.isEmpty else { return }
+        let page = min(max(index, 0), stops.count - 1)
+        panGestureOrigin = nil
+        animateWorkspacePan(to: stops[page], on: screen)
+    }
+
+    private func animateWorkspacePan(to target: CGFloat, on screen: NSScreen) {
+        panSnapWork?.cancel()
+        panAnimTimer?.invalidate()
+        let group = workspaceGroup(on: screen)
+        captureLayoutFrames(group)
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        let content = layoutUnion(group)
+        let (lo, hi) = panRange(content: content, viewport: view)
+        let clamped = min(max(target, lo), hi)
+        if abs(clamped - workspacePan) < 0.5 {
+            workspacePan = clamped
+            workspaceLayoutActive = true
+            placeWorkspaceWindows(group, viewport: view)
+            workspaceLayoutActive = false
+            workspacePanning = false
+            showPageDots(on: screen, linger: true)
+            schedulePersist()
+            return
+        }
+        panAnimStart = workspacePan
+        panAnimTarget = clamped
+        panAnimStartTime = ProcessInfo.processInfo.systemUptime
+        workspacePanning = true
+        showPageDots(on: screen, linger: false)
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            let u = min(1, (ProcessInfo.processInfo.systemUptime - self.panAnimStartTime) / 0.22)
+            let eased = 1 - (1 - u) * (1 - u) * (1 - u)
+            self.workspacePan = self.panAnimStart + (self.panAnimTarget - self.panAnimStart) * CGFloat(eased)
+            self.placeWorkspaceWindows(self.workspaceGroup(on: screen), viewport: ShuttleWindowChrome.workspace(on: screen))
+            self.showPageDots(on: screen, linger: false)
+            if u >= 1 {
+                timer.invalidate()
+                self.panAnimTimer = nil
+                self.workspacePan = self.panAnimTarget
+                self.workspacePanning = false
+                self.showPageDots(on: screen, linger: true)
+                self.schedulePersist()
+            }
+        }
+        panAnimTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func showPageDots(on screen: NSScreen?, linger: Bool) {
+        guard ShuttleWindowChrome.usesHalfDisplay, let screen else {
+            hidePageDots()
+            return
+        }
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        let stops = pageStops(on: screen)
+        guard stops.count > 1 else {
+            hidePageDots()
+            return
+        }
+        let dots = ensurePageDots()
+        dots.pageCount = stops.count
+        dots.currentPage = nearestPageIndex(stops)
+        dots.onSelect = { [weak self] page in
+            self?.goToPage(page, on: screen)
+        }
+        let size = WorkspacePageDotsView.size(for: stops.count)
+        let frame = NSRect(
+            x: view.midX - size.width / 2,
+            y: view.minY + 14,
+            width: size.width,
+            height: size.height
+        )
+        pageDotsPanel?.setFrame(frame, display: true)
+        pageDotsPanel?.orderFrontRegardless()
+        pageDotsHideWork?.cancel()
+        guard linger, !pageDotsHovered else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.pageDotsHovered, !self.workspacePanning else { return }
+            self.hidePageDots()
+        }
+        pageDotsHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+    }
+
+    private func hidePageDots() {
+        pageDotsHideWork?.cancel()
+        pageDotsHideWork = nil
+        pageDotsHovered = false
+        pageDotsPanel?.orderOut(nil)
+    }
+
+    private func ensurePageDots() -> WorkspacePageDotsView {
+        if let pageDotsView {
+            return pageDotsView
+        }
+        let dots = WorkspacePageDotsView(frame: .zero)
+        dots.onHover = { [weak self] hovering in
+            guard let self else { return }
+            self.pageDotsHovered = hovering
+            if hovering {
+                self.pageDotsHideWork?.cancel()
+            } else if !self.workspacePanning {
+                self.showPageDots(on: self.pageDotsPanel?.screen, linger: true)
+            }
+        }
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 80, height: 28),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.isMovableByWindowBackground = false
+        panel.identifier = NSUserInterfaceItemIdentifier("shuttleterm.workspace.pages")
+        panel.contentView = dots
+        pageDotsPanel = panel
+        pageDotsView = dots
+        return dots
+    }
+
+    private func panRange(content: NSRect, viewport: NSRect) -> (CGFloat, CGFloat) {
+        let alignLeft = viewport.minX - content.minX
+        let alignRight = viewport.maxX - content.maxX
+        return (min(alignLeft, alignRight), max(alignLeft, alignRight))
+    }
+
+    private func workspaceGroup(on screen: NSScreen) -> [ShuttleTerminalSession] {
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        return sessions.filter {
+            !$0.window.isMiniaturized
+                && !$0.window.styleMask.contains(.fullScreen)
+                && (
+                    $0.window.screen === screen
+                        || $0.workspaceParked
+                        || view.intersects($0.window.frame)
+                        || ($0.layoutFrame.map { view.intersects($0) || ShuttleWindowChrome.layoutBounds(on: screen).intersects($0) } ?? false)
+                )
+        }
+    }
+
+    private func captureLayoutFrames(_ group: [ShuttleTerminalSession]) {
+        for session in group where session.layoutFrame == nil {
+            var frame = session.window.frame
+            frame.origin.x -= workspacePan
+            session.layoutFrame = frame
+        }
+    }
+
+    private func layoutUnion(_ group: [ShuttleTerminalSession]) -> NSRect {
+        var union: NSRect?
+        for session in group {
+            let frame = session.layoutFrame ?? session.window.frame
+            union = union.map { $0.union(frame) } ?? frame
+        }
+        return union ?? .zero
+    }
+
+    private func placeWorkspaceWindows() {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return }
+        workspaceLayoutActive = true
+        let groups = Dictionary(grouping: sessions.filter { !$0.window.isMiniaturized }) { session -> ObjectIdentifier in
+            let screen = session.window.screen ?? NSScreen.main ?? NSScreen.screens.first
+            return ObjectIdentifier(screen ?? session.window)
+        }
+        for group in groups.values {
+            let screen = group[0].window.screen ?? NSScreen.main
+            placeWorkspaceWindows(group, viewport: ShuttleWindowChrome.workspace(on: screen))
+        }
+        workspaceLayoutActive = false
+    }
+
+    private func placeWorkspaceWindows(_ group: [ShuttleTerminalSession], viewport view: NSRect) {
+        var shown: [(ShuttleTerminalSession, NSRect)] = []
+        for session in group {
+            guard var frame = session.layoutFrame else { continue }
+            frame.origin.x += workspacePan
+            if frame.maxY > view.maxY { frame.origin.y = view.maxY - frame.height }
+            if frame.minY < view.minY { frame.origin.y = view.minY }
+            if ShuttleWindowChrome.carouselShows(frame, in: view) {
+                shown.append((session, frame))
+            } else {
+                parkWorkspaceWindow(session)
+            }
+        }
+        for (session, frame) in shown {
+            let current = session.window.frame
+            let sizeChanged = abs(current.width - frame.width) > 1
+                || abs(current.height - frame.height) > 1
+            let moved = abs(current.minX - frame.minX) > 0.5
+                || abs(current.minY - frame.minY) > 0.5
+            if session.workspaceParked || !session.window.isVisible || sizeChanged {
+                session.tile(in: frame, reveal: false)
+                session.window.orderFrontRegardless()
+            } else if moved {
+                session.window.setFrame(frame, display: true, animate: false)
+            }
+            session.workspaceParked = false
+        }
+    }
+
+    /// Snap each window to an Align-grid cell, keep those already in the chosen
+    /// half, and hide the rest until a swipe pans them in.
+    private func adoptHalfDisplayFrames() {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return }
+        workspaceLayoutActive = true
+        workspacePan = 0
+        let groups = Dictionary(grouping: sessions.filter { !$0.window.isMiniaturized }) { session -> ObjectIdentifier in
+            let screen = session.window.screen ?? NSScreen.main ?? NSScreen.screens.first
+            return ObjectIdentifier(screen ?? session.window)
+        }
+        for group in groups.values {
+            let screen = group[0].window.screen ?? NSScreen.main
+            let view = ShuttleWindowChrome.workspace(on: screen)
+            for session in group {
+                session.layoutFrame = session.window.isVisible
+                    ? session.window.frame
+                    : (session.layoutFrame ?? session.window.frame)
+            }
+            snapGroupToGrid(group, on: screen)
+            let insideCount = group.filter {
+                ShuttleWindowChrome.carouselShows(
+                    ($0.layoutFrame ?? $0.window.frame).offsetBy(dx: workspacePan, dy: 0),
+                    in: view
+                )
+            }.count
+            if insideCount == 0 {
+                shiftGroupIntoHalf(group, viewport: view)
+            }
+            placeWorkspaceWindows(group, viewport: view)
+            showPageDots(on: screen, linger: true)
+        }
+        workspaceLayoutActive = false
+    }
+
+    private func resnapHalfDisplayGrid() {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return }
+        workspaceLayoutActive = true
+        let groups = Dictionary(grouping: sessions.filter { !$0.window.isMiniaturized }) { session -> ObjectIdentifier in
+            let screen = session.window.screen ?? NSScreen.main ?? NSScreen.screens.first
+            return ObjectIdentifier(screen ?? session.window)
+        }
+        for group in groups.values {
+            let screen = group[0].window.screen ?? NSScreen.main
+            snapGroupToGrid(group, on: screen)
+            placeWorkspaceWindows(group, viewport: ShuttleWindowChrome.workspace(on: screen))
+            showPageDots(on: screen, linger: true)
+        }
+        workspaceLayoutActive = false
+    }
+
+    /// Place each window on the nearest free Align-grid cell (full-screen cell size).
+    private func snapGroupToGrid(_ group: [ShuttleTerminalSession], on screen: NSScreen?) {
+        let vis = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let (cols, rows) = alignGridSize()
+        var taken = Set<String>()
+        func key(_ col: Int, _ row: Int) -> String { "\(col),\(row)" }
+        let ordered = group.sorted { a, b in
+            let fa = a.layoutFrame ?? a.window.frame
+            let fb = b.layoutFrame ?? b.window.frame
+            if abs(fa.maxY - fb.maxY) > 20 { return fa.maxY > fb.maxY }
+            return fa.minX < fb.minX
+        }
+        var overflow = 0
+        let half = ShuttleWindowChrome.normalizedDisplaySize(displaySize)
+        for session in ordered {
+            let frame = session.layoutFrame ?? session.window.frame
+            var col = Int(floor((frame.midX - vis.minX) / max(vis.width, 1) * CGFloat(cols)))
+            var row = Int(floor((frame.midY - vis.minY) / max(vis.height, 1) * CGFloat(rows)))
+            col = min(max(col, 0), max(cols - 1, 0))
+            row = min(max(row, 0), max(rows - 1, 0))
+            if taken.contains(key(col, row)) {
+                if let free = nearestFreeCell(col: col, row: row, cols: cols, rows: rows, taken: taken) {
+                    col = free.0
+                    row = free.1
+                } else {
+                    overflow += 1
+                    col = half == "left" ? -overflow : cols - 1 + overflow
+                }
+            }
+            taken.insert(key(col, row))
+            session.layoutFrame = cellFrame(vis: vis, cols: cols, rows: rows, col: col, rowFromBottom: row)
+        }
+    }
+
+    private func nearestFreeCell(
+        col: Int,
+        row: Int,
+        cols: Int,
+        rows: Int,
+        taken: Set<String>
+    ) -> (Int, Int)? {
+        func key(_ c: Int, _ r: Int) -> String { "\(c),\(r)" }
+        let maxDist = max(cols, rows)
+        for dist in 1...maxDist {
+            for dc in -dist...dist {
+                for dr in -dist...dist {
+                    if max(abs(dc), abs(dr)) != dist { continue }
+                    let c = col + dc
+                    let r = row + dr
+                    if c < 0 || r < 0 || c >= cols || r >= rows { continue }
+                    if !taken.contains(key(c, r)) { return (c, r) }
+                }
+            }
+        }
+        return nil
+    }
+
+    func gridCellSize(on screen: NSScreen?) -> NSSize {
+        let vis = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let (cols, rows) = alignGridSize()
+        return NSSize(
+            width: vis.width / CGFloat(max(cols, 1)),
+            height: vis.height / CGFloat(max(rows, 1))
+        )
+    }
+
+    /// When every window sits in the other half, slide the group as a unit into
+    /// the chosen half so relative positions stay the same.
+    private func shiftGroupIntoHalf(_ group: [ShuttleTerminalSession], viewport view: NSRect) {
+        var union: NSRect?
+        for session in group {
+            let frame = session.layoutFrame ?? session.window.frame
+            union = union.map { $0.union(frame) } ?? frame
+        }
+        guard let union, union.width > 1 else { return }
+        let size = ShuttleWindowChrome.normalizedDisplaySize(displaySize)
+        let dx = size == "left"
+            ? view.maxX - union.maxX
+            : view.minX - union.minX
+        guard abs(dx) >= 1 else { return }
+        for session in group {
+            guard var frame = session.layoutFrame else { continue }
+            frame.origin.x += dx
+            session.layoutFrame = frame
+        }
+    }
+
+    private func parkWorkspaceWindow(_ session: ShuttleTerminalSession) {
+        session.workspaceParked = true
+        if session.window.isVisible {
+            session.window.orderOut(nil)
+        }
+    }
+
+    private func unparkWorkspaceWindows() {
+        workspaceLayoutActive = true
+        for session in sessions where session.workspaceParked {
+            session.workspaceParked = false
+            session.window.orderFrontRegardless()
+        }
+        workspaceLayoutActive = false
+    }
+
+    func syncLayoutFrame(_ session: ShuttleTerminalSession) {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return }
+        var frame = session.window.frame
+        frame.origin.x -= workspacePan
+        session.layoutFrame = frame
+    }
+
+    func revealInWorkspace(_ session: ShuttleTerminalSession) {
+        guard ShuttleWindowChrome.usesHalfDisplay else { return }
+        captureLayoutFrames([session])
+        guard let layout = session.layoutFrame else { return }
+        let view = ShuttleWindowChrome.workspace(for: session.window)
+        let shown = layout.offsetBy(dx: workspacePan, dy: 0)
+        if shown.minX >= view.minX - 1, shown.maxX <= view.maxX + 1 {
+            if session.workspaceParked {
+                workspaceLayoutActive = true
+                placeWorkspaceWindows([session], viewport: view)
+                workspaceLayoutActive = false
+            }
+            return
+        }
+        let target: CGFloat
+        if layout.width >= view.width - 1 {
+            target = view.minX - layout.minX
+        } else if shown.minX < view.minX {
+            target = view.minX - layout.minX
+        } else {
+            target = view.maxX - layout.maxX
+        }
+        let nsScreen = session.window.screen ?? NSScreen.main ?? NSScreen.screens.first
+        let content: NSRect
+        if let nsScreen {
+            content = layoutUnion(workspaceGroup(on: nsScreen))
+        } else {
+            content = layout
+        }
+        let (lo, hi) = panRange(content: content.width > 1 ? content : layout, viewport: view)
+        workspacePan = min(max(target, lo), hi)
+        placeWorkspaceWindows()
     }
 
     @objc func persistOpenWindows() {
         persistWork?.cancel()
         persistWork = nil
         guard restoreWindows else { return }
-        let snaps = sessions.filter { $0.window.isVisible }.map { $0.snapshot() }
+        let snaps = sessions.filter { isWorkspaceOpen($0) }.map { $0.snapshot() }
         ShuttleSessionStore.save(snaps)
     }
 
@@ -234,6 +904,10 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         installMenusIfNeeded()
         for snap in snaps {
             restoreSnapshot(snap)
+        }
+        if ShuttleWindowChrome.usesHalfDisplay {
+            adoptHalfDisplayFrames()
+            sessions.forEach { $0.applyHalfDisplayWindowLock(true) }
         }
         refreshSplitMenus()
         return true
@@ -259,10 +933,15 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         sessions.append(session)
         session.makeKeyAndOrderFront()
         keySession = session
+        if ShuttleWindowChrome.usesHalfDisplay {
+            session.applyHalfDisplayWindowLock(true)
+        }
     }
 
     func sessionDidClose(_ session: ShuttleTerminalSession) {
-        rememberWindowSize(session.window.frame.size)
+        if !ShuttleWindowChrome.usesHalfDisplay {
+            rememberWindowSize(session.window.frame.size)
+        }
         ShuttleAttention.shared.clear(session)
         sessions.removeAll { $0 === session }
         if keySession === session {
@@ -270,6 +949,11 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         }
         refreshSplitMenus()
         persistOpenWindows()
+        if sessions.isEmpty {
+            hidePageDots()
+        } else {
+            showPageDots(on: session.window.screen ?? NSScreen.main, linger: true)
+        }
     }
 
     func session(attentionId: String) -> ShuttleTerminalSession? {
@@ -282,7 +966,11 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     }
 
     @objc var visibleWindowCount: Int {
-        sessions.filter { $0.window.isVisible }.count
+        sessions.filter { isWorkspaceOpen($0) }.count
+    }
+
+    private func isWorkspaceOpen(_ session: ShuttleTerminalSession) -> Bool {
+        (session.window.isVisible || session.workspaceParked) && !session.window.isMiniaturized
     }
 
     @objc func attachMenubarSplitMenu(_ menu: NSMenu) {
@@ -293,6 +981,12 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
 
     @objc func attachMenubarAlignMenu(_ menu: NSMenu) {
         fillAlignMenu(menu)
+    }
+
+    @objc func attachMenubarDisplaySizeMenu(_ menu: NSMenu) {
+        menu.delegate = self
+        menubarDisplaySizeMenu = menu
+        fillDisplaySizeMenu(menu)
     }
 
     @objc func fillSplitMenu(_ menu: NSMenu) {
@@ -317,6 +1011,36 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         }
     }
 
+    private func fillDisplaySizeMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let current = ShuttleWindowChrome.normalizedDisplaySize(displaySize)
+        for (title, value) in [
+            ("Full", "full"),
+            ("Left half", "left"),
+            ("Right half", "right")
+        ] {
+            let item = NSMenuItem(title: title, action: #selector(displaySizeFromMenu(_:)), keyEquivalent: "")
+            item.representedObject = value
+            item.target = self
+            item.state = current == value ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
+    @objc func displaySizeFromMenu(_ sender: NSMenuItem) {
+        let value = (sender.representedObject as? String) ?? sender.title
+        applyDisplaySize(value)
+    }
+
+    @objc func refreshDisplaySizeMenus() {
+        if let displaySizeMenu {
+            fillDisplaySizeMenu(displaySizeMenu)
+        }
+        if let menubarDisplaySizeMenu {
+            fillDisplaySizeMenu(menubarDisplaySizeMenu)
+        }
+    }
+
     @objc func alignFromMenu(_ sender: NSMenuItem) {
         guard let edge = AlignEdge(rawValue: sender.tag) else { return }
         alignWindows(edge)
@@ -325,6 +1049,9 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu.title == "Split" {
             fillSplitMenu(menu)
+        }
+        if menu.title == "App Display Size" {
+            fillDisplaySizeMenu(menu)
         }
     }
 
@@ -365,6 +1092,18 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         if menuItem.title == "Align" || menuItem.action == #selector(alignFromMenu(_:)) {
             return visibleWindowCount >= 1
         }
+        if menuItem.action == #selector(NSWindow.performMiniaturize(_:))
+            || menuItem.action == #selector(NSWindow.performZoom(_:)) {
+            return !ShuttleWindowChrome.usesHalfDisplay && keySession != nil
+        }
+        if menuItem.title == "App Display Size" || menuItem.action == #selector(displaySizeFromMenu(_:)) {
+            if menuItem.action == #selector(displaySizeFromMenu(_:)) {
+                let value = (menuItem.representedObject as? String)
+                    ?? ShuttleWindowChrome.normalizedDisplaySize(menuItem.title)
+                menuItem.state = ShuttleWindowChrome.normalizedDisplaySize(displaySize) == value ? .on : .off
+            }
+            return true
+        }
         if menuItem.action == #selector(newWindow(_:)) ||
             menuItem.action == #selector(promptAndRunCommand(_:)) ||
             menuItem.action == #selector(splitFromMenu(_:)) ||
@@ -403,31 +1142,44 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
 
     private func tileGroup(_ tiles: [ShuttleTerminalSession]) {
         guard !tiles.isEmpty else { return }
-        let screen = tiles[0].window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        var union = tiles[0].window.frame
-        for session in tiles.dropFirst() {
-            union = union.union(session.window.frame)
+        if ShuttleWindowChrome.usesHalfDisplay {
+            tileGroupOnGrid(tiles)
+            return
         }
-        union = union.intersection(screen)
-        let minW = max(360, screen.width * ShuttleWindowChrome.snapWidthFraction)
-        let minH = max(180, screen.height * ShuttleWindowChrome.snapHeightFraction)
-        if union.width < minW || union.height < minH {
-            union = screen
+        let nsScreen = tiles[0].window.screen ?? NSScreen.main
+        let layout = ShuttleWindowChrome.layoutBounds(on: nsScreen)
+        let view = ShuttleWindowChrome.workspace(on: nsScreen)
+        var union = layout
+        if !ShuttleWindowChrome.usesHalfDisplay {
+            union = tiles[0].window.frame
+            for session in tiles.dropFirst() {
+                union = union.union(session.window.frame)
+            }
+            union = union.intersection(layout)
+            let minW = max(min(360, layout.width), layout.width * ShuttleWindowChrome.snapWidthFraction)
+            let minH = max(min(180, layout.height), layout.height * ShuttleWindowChrome.snapHeightFraction)
+            if union.width < minW || union.height < minH {
+                union = layout
+            }
         }
         let sorted = sortVisual(tiles)
         let (cols, rows) = gridForUnion(count: sorted.count, union: union)
         let gap: CGFloat = 4
         let cellW = (union.width - gap * CGFloat(cols + 1)) / CGFloat(max(cols, 1))
         let cellH = (union.height - gap * CGFloat(rows + 1)) / CGFloat(max(rows, 1))
+        workspaceLayoutActive = true
+        workspacePan = 0
         for (index, session) in sorted.enumerated() {
             let col = index % cols
             let row = index / cols
             let x = union.minX + gap + CGFloat(col) * (cellW + gap)
             let y = union.maxY - gap - CGFloat(row + 1) * cellH - CGFloat(row) * gap
-            session.tile(in: NSRect(x: x, y: y, width: max(cellW, 120), height: max(cellH, 80)))
+            let frame = NSRect(x: x, y: y, width: max(cellW, 120), height: max(cellH, 80))
+            session.layoutFrame = frame
         }
+        placeWorkspaceWindows(sorted, viewport: view)
+        workspaceLayoutActive = false
+        showPageDots(on: nsScreen, linger: true)
     }
 
     private func sortVisual(_ tiles: [ShuttleTerminalSession]) -> [ShuttleTerminalSession] {
@@ -468,7 +1220,7 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     private func alignWindows(_ edge: AlignEdge, raise: Bool = true) {
         installMenusIfNeeded()
         let open = sessions.filter {
-            $0.window.isVisible && !$0.window.isMiniaturized && !$0.window.styleMask.contains(.fullScreen)
+            isWorkspaceOpen($0) && !$0.window.styleMask.contains(.fullScreen)
         }
         guard !open.isEmpty else { return }
         lastLayout = .align(edge)
@@ -482,24 +1234,93 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         }
         if raise {
             activateApplication()
-            for session in open {
-                session.window.orderFrontRegardless()
-            }
-            (keySession ?? open.last)?.makeKeyAndOrderFront()
+            let visible = open.filter { !$0.workspaceParked && $0.window.isVisible }
+            (keySession.flatMap { session in visible.contains(where: { $0 === session }) ? session : nil }
+                ?? visible.last
+                ?? open.last)?.makeKeyAndOrderFront()
+        }
+        if ShuttleWindowChrome.usesHalfDisplay {
+            open.forEach { $0.applyHalfDisplayWindowLock(true) }
         }
         schedulePersist()
     }
 
+    /// Split in half mode keeps Align-grid cell size and fills free cells.
+    private func tileGroupOnGrid(_ tiles: [ShuttleTerminalSession]) {
+        let nsScreen = tiles[0].window.screen ?? NSScreen.main
+        let vis = nsScreen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let view = ShuttleWindowChrome.workspace(on: nsScreen)
+        let (cols, rows) = alignGridSize()
+        func key(_ col: Int, _ row: Int) -> String { "\(col),\(row)" }
+        var taken = Set<String>()
+        for other in sessions where !tiles.contains(where: { $0 === other }) {
+            let frame = other.layoutFrame ?? other.window.frame
+            let col = Int(floor((frame.midX - vis.minX) / max(vis.width, 1) * CGFloat(cols)))
+            let row = Int(floor((frame.midY - vis.minY) / max(vis.height, 1) * CGFloat(rows)))
+            taken.insert(key(col, row))
+        }
+        var cells: [NSRect] = []
+        for rowFromTop in 0..<rows {
+            let row = rows - 1 - rowFromTop
+            for col in 0..<cols {
+                if taken.contains(key(col, row)) { continue }
+                cells.append(cellFrame(vis: vis, cols: cols, rows: rows, col: col, rowFromBottom: row))
+            }
+        }
+        let viewCells = cells.filter { ShuttleWindowChrome.carouselShows($0, in: view) }
+        let overflowCells = cells.filter { !ShuttleWindowChrome.carouselShows($0, in: view) }
+        let orderedCells = viewCells + overflowCells
+        let half = ShuttleWindowChrome.normalizedDisplaySize(displaySize)
+        let sorted = sortVisual(tiles)
+        workspaceLayoutActive = true
+        workspacePan = 0
+        var extra = 0
+        for (index, session) in sorted.enumerated() {
+            if index < orderedCells.count {
+                session.layoutFrame = orderedCells[index]
+            } else {
+                extra += 1
+                let col = half == "left" ? -extra : cols - 1 + extra
+                session.layoutFrame = cellFrame(
+                    vis: vis,
+                    cols: cols,
+                    rows: rows,
+                    col: col,
+                    rowFromBottom: max(rows - 1, 0)
+                )
+            }
+        }
+        placeWorkspaceWindows(sorted, viewport: view)
+        workspaceLayoutActive = false
+        sorted.forEach { $0.applyHalfDisplayWindowLock(true) }
+        showPageDots(on: nsScreen, linger: true)
+    }
+
     private func alignGroup(_ tiles: [ShuttleTerminalSession], edge: AlignEdge) {
         guard !tiles.isEmpty else { return }
-        let screen = tiles[0].window.screen ?? NSScreen.main ?? NSScreen.screens.first
-        let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let nsScreen = tiles[0].window.screen ?? NSScreen.main
+        let layout = ShuttleWindowChrome.layoutBounds(on: nsScreen)
+        let view = ShuttleWindowChrome.workspace(on: nsScreen)
         let (cols, rows) = alignGridSize()
         let ordered = orderForAlign(tiles, edge: edge, cols: cols, rows: rows)
+        workspaceLayoutActive = true
         for (index, session) in ordered.enumerated() {
-            let frame = alignFrame(vis: vis, cols: cols, rows: rows, index: index, edge: edge)
-            session.tile(in: frame, reveal: false)
+            let frame = alignFrame(vis: layout, cols: cols, rows: rows, index: index, edge: edge)
+            session.layoutFrame = frame
         }
+        let content = layoutUnion(ordered)
+        let (lo, hi) = panRange(content: content, viewport: view)
+        switch edge {
+        case .left, .top:
+            workspacePan = min(max(view.minX - content.minX, lo), hi)
+        case .right, .bottom:
+            workspacePan = min(max(view.maxX - content.maxX, lo), hi)
+        }
+        placeWorkspaceWindows(ordered, viewport: view)
+        workspaceLayoutActive = false
+        showPageDots(on: nsScreen, linger: true)
     }
 
     /// Keep current relative positions: pick the next strip of windows from the
@@ -634,6 +1455,11 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     }
 
     private func cascade(_ window: NSWindow) {
+        if ShuttleWindowChrome.usesHalfDisplay,
+           let session = sessions.last, session.window === window {
+            placeOnFreeGridCell(session, inViewport: true)
+            return
+        }
         if let size = sizeForNewWindow() {
             var frame = window.frame
             frame.size = size
@@ -641,20 +1467,62 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         }
         rememberWindowSize(window.frame.size)
         let offset = CGFloat(sessions.count) * 22
-        let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
-        if let screen {
-            var origin = NSPoint(
-                x: screen.minX + 80 + offset,
-                y: screen.maxY - window.frame.height - 80 - offset
-            )
-            if origin.x + window.frame.width > screen.maxX {
-                origin.x = screen.maxX - window.frame.width
-            }
-            if origin.y < screen.minY {
-                origin.y = screen.minY
-            }
-            window.setFrameOrigin(origin)
+        let screen = ShuttleWindowChrome.workspace(on: window.screen ?? NSScreen.main)
+        var frame = window.frame
+        frame.size.width = min(frame.width, screen.width)
+        frame.size.height = min(frame.height, screen.height)
+        var origin = NSPoint(
+            x: screen.minX + 80 + offset,
+            y: screen.maxY - frame.height - 80 - offset
+        )
+        if origin.x + frame.width > screen.maxX {
+            origin.x = screen.maxX - frame.width
         }
+        if origin.x < screen.minX {
+            origin.x = screen.minX
+        }
+        if origin.y < screen.minY {
+            origin.y = screen.minY
+        }
+        frame.origin = origin
+        window.setFrame(frame, display: false)
+        if let session = sessions.last, session.window === window {
+            session.layoutFrame = frame.offsetBy(dx: -workspacePan, dy: 0)
+            session.workspaceParked = false
+        }
+    }
+
+    private func placeOnFreeGridCell(_ session: ShuttleTerminalSession, inViewport: Bool) {
+        let screen = session.window.screen ?? NSScreen.main
+        let vis = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let view = ShuttleWindowChrome.workspace(on: screen)
+        let (cols, rows) = alignGridSize()
+        var taken = Set<String>()
+        for other in sessions where other !== session {
+            let frame = other.layoutFrame ?? other.window.frame
+            let col = Int(floor((frame.midX - vis.minX) / max(vis.width, 1) * CGFloat(cols)))
+            let row = Int(floor((frame.midY - vis.minY) / max(vis.height, 1) * CGFloat(rows)))
+            taken.insert("\(col),\(row)")
+        }
+        var placed: NSRect?
+        for rowFromTop in 0..<rows {
+            let row = rows - 1 - rowFromTop
+            for col in 0..<cols {
+                if taken.contains("\(col),\(row)") { continue }
+                let cell = cellFrame(vis: vis, cols: cols, rows: rows, col: col, rowFromBottom: row)
+                if inViewport, !ShuttleWindowChrome.carouselShows(cell, in: view) { continue }
+                placed = cell
+                break
+            }
+            if placed != nil { break }
+        }
+        let frame = placed ?? cellFrame(vis: vis, cols: cols, rows: rows, col: 0, rowFromBottom: rows - 1)
+        session.layoutFrame = frame.offsetBy(dx: -workspacePan, dy: 0)
+        workspaceLayoutActive = true
+        placeWorkspaceWindows([session], viewport: view)
+        workspaceLayoutActive = false
     }
 
     private func sizeForNewWindow() -> NSSize? {
@@ -753,9 +1621,16 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
         fillAlignMenu(alignSub)
         let alignRoot = NSMenuItem(title: "Align", action: nil, keyEquivalent: "")
         alignRoot.submenu = alignSub
+        let displaySub = NSMenu(title: "App Display Size")
+        displaySub.delegate = self
+        fillDisplaySizeMenu(displaySub)
+        displaySizeMenu = displaySub
+        let displayRoot = NSMenuItem(title: "App Display Size", action: nil, keyEquivalent: "")
+        displayRoot.submenu = displaySub
         windowMenu.submenu?.addItem(.separator())
         windowMenu.submenu?.addItem(splitRoot)
         windowMenu.submenu?.addItem(alignRoot)
+        windowMenu.submenu?.addItem(displayRoot)
 
         let terminal = makeMenu(
             title: "Terminal",
@@ -930,6 +1805,12 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
       "lock_after_sleep": true | false  hide terminals after sleep or screen lock
                                         until Touch ID or the Mac password
       "align_grid": "5x4" | "4x3"       cells used by Align Right/Left/Top/Bottom
+      "display_size": "full" | "left" | "right"
+                                        keep windows on the full screen or one half.
+                                        Switching from full keeps current window
+                                        positions, then snaps each to an Align-grid
+                                        cell. Minimize and resize are off on a half;
+                                        swipe pages hidden windows in.
       "startup" hosts open when the app launches
                                         (skipped when restored windows exist)
 
@@ -938,6 +1819,15 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
     Align grid (Settings: 5×4 or 4×3) is how many cells fit in a row or column.
     Align keeps each window’s current relative position.
     Changing Align grid in Settings re-applies Align immediately.
+    App display size (status menu, Window menu, or Settings: Full, Left half,
+    Right half) limits Align, Split,
+    snap, and dragging to that part of the screen. Switching from Full to a half
+    keeps each window where it is, then snaps it to an Align-grid cell (full-screen
+    cell size). Minimize and resize are off; drag the title bar to move. Windows
+    already in that half stay put, and the rest stay hidden until a two-finger
+    swipe (or Shift+wheel) pages them in. Dots overlay the bottom of a window
+    while you swipe. On a half, Align uses full-screen cell sizes so the strip
+    is wider than the half.
     Full-screen coding-agent sessions fill the window (inner padding is
     removed while they run).
 
@@ -962,14 +1852,14 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
       Otherwise Ctrl-C goes to the remote app (ssh/shell)
 
     Attention
-      An unfocused session that needs input badges the Dock and shows a banner
-      with the host name and “Action required”.
-      Click the banner or focus the window to clear it.
+      An unfocused session that needs input badges the Dock and shows a
+      notification with the host name and “Action required”.
+      Hover the window, click Close, or focus it to dismiss.
       Dock badge: System Settings → Notifications → ShuttleTerm → Badge App Icon.
 
     Each host opens in its own window (File menu or the status item).
     Split lists only counts that match the number of open windows.
-    Align is in the Window menu and the status menu, just after Split.
+    Align and App Display Size are in the Window menu and the status menu, just after Split.
     Each window has its own font and background (View → Theme / Font).
     """
 
@@ -1018,6 +1908,95 @@ final class ShuttleTerminalController: NSObject, NSMenuItemValidation, NSMenuDel
 
     @objc private func clearScrollback(_ sender: Any?) {
         keySession?.clearScrollback()
+    }
+}
+
+private final class WorkspacePageDotsView: NSView {
+    static let dot: CGFloat = 8
+    static let gap: CGFloat = 9
+    static let padX: CGFloat = 12
+    static let padY: CGFloat = 8
+
+    var pageCount = 1 {
+        didSet { needsDisplay = true }
+    }
+    var currentPage = 0 {
+        didSet { needsDisplay = true }
+    }
+    var onSelect: ((Int) -> Void)?
+    var onHover: ((Bool) -> Void)?
+
+    static func size(for count: Int) -> NSSize {
+        let n = CGFloat(max(count, 1))
+        return NSSize(
+            width: padX * 2 + n * dot + max(n - 1, 0) * gap,
+            height: padY * 2 + dot
+        )
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 14
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHover?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHover?(false)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x
+        let inner = max(bounds.width - Self.padX * 2, 1)
+        let idx = Int(((x - Self.padX) / inner) * CGFloat(max(pageCount, 1)))
+        onSelect?(min(max(idx, 0), pageCount - 1))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let pill = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        NSColor.black.withAlphaComponent(0.42).setFill()
+        pill.fill()
+        NSColor.white.withAlphaComponent(0.12).setStroke()
+        pill.lineWidth = 1
+        pill.stroke()
+
+        for index in 0..<max(pageCount, 1) {
+            let x = Self.padX + CGFloat(index) * (Self.dot + Self.gap)
+            let y = (bounds.height - Self.dot) / 2
+            let rect = NSRect(x: x, y: y, width: Self.dot, height: Self.dot)
+            let dot = NSBezierPath(ovalIn: rect)
+            if index == currentPage {
+                NSColor.white.setFill()
+            } else {
+                NSColor.white.withAlphaComponent(0.38).setFill()
+            }
+            dot.fill()
+        }
     }
 }
 

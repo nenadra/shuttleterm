@@ -2,8 +2,9 @@
 //  ShuttleAttention.swift
 //  ShuttleTerm
 //
-//  One banner and one Notification Center item per terminal window that needs
-//  a response. The Dock badge is that window count. Badge and notification
+//  One system-style banner and one Notification Center item per terminal
+//  window that needs a response. Hovering that window or clicking Close
+//  dismisses it. The Dock badge is that window count. Badge and notification
 //  center APIs run off the main thread so this ad-hoc signed app does not
 //  deadlock against usernoted/TCC at launch.
 //
@@ -18,20 +19,58 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
     private var pendingIds = Set<String>()
     private var pendingOrder: [String] = []
     private var banners: [String: NSPanel] = [:]
-    private let notifyQueue = DispatchQueue(label: "shuttleterm.attention.notify")
+    private let notifyQueue = DispatchQueue(label: "shuttleterm.attention.notify", qos: .userInitiated)
     private var didPrepare = false
+    private var notifyReady = false
+    private var queuedPosts: [(identifier: String, title: String, body: String, count: Int)] = []
 
     private override init() {
         super.init()
     }
 
     @objc func prepare() {
-        notifyQueue.async { [weak self] in
+        onMain { [weak self] in
             guard let self, !self.didPrepare else { return }
             self.didPrepare = true
-            let center = UNUserNotificationCenter.current()
-            center.delegate = self
-            center.requestAuthorization(options: [.badge, .alert]) { _, _ in }
+            UNUserNotificationCenter.current().delegate = self
+            self.notifyQueue.async {
+                let center = UNUserNotificationCenter.current()
+                center.getNotificationSettings { settings in
+                    self.notifyQueue.async {
+                        self.applyAuthorization(settings.authorizationStatus, center: center)
+                    }
+                }
+                self.notifyQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self, !self.notifyReady else { return }
+                    self.notifyReady = true
+                    self.flushQueuedNotifications()
+                }
+            }
+        }
+    }
+
+    private func applyAuthorization(_ status: UNAuthorizationStatus, center: UNUserNotificationCenter) {
+        switch status {
+        case .authorized, .provisional:
+            notifyReady = true
+            flushQueuedNotifications()
+        case .denied:
+            notifyReady = true
+            queuedPosts.removeAll()
+        case .notDetermined:
+            center.requestAuthorization(options: [.badge, .alert]) { granted, _ in
+                self.notifyQueue.async {
+                    self.notifyReady = true
+                    if granted {
+                        self.flushQueuedNotifications()
+                    } else {
+                        self.queuedPosts.removeAll()
+                    }
+                }
+            }
+        default:
+            notifyReady = true
+            flushQueuedNotifications()
         }
     }
 
@@ -46,6 +85,7 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
     func noteBell(from session: ShuttleTerminalSession) {
         onMain {
             if session.isRestoring { return }
+            if session.suppressesAttention { return }
             if ShuttleAppLock.shared.isLocked {
                 self.raiseLocked(session: session)
                 return
@@ -62,9 +102,10 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    func noteNotify(from session: ShuttleTerminalSession) {
+    func noteNotify(from session: ShuttleTerminalSession, title: String? = nil, body: String? = nil) {
         onMain {
             if session.isRestoring { return }
+            if session.suppressesAttention { return }
             if ShuttleAppLock.shared.isLocked {
                 self.raiseLocked(session: session)
                 return
@@ -72,8 +113,34 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
             if session.window.isKeyWindow && NSApp.isActive {
                 return
             }
+            self.raise(
+                session: session,
+                title: Self.resolvedTitle(title, session: session),
+                body: Self.resolvedBody(body, session: session)
+            )
+        }
+    }
+
+    func noteBackgroundWait(from session: ShuttleTerminalSession) {
+        onMain {
+            if session.isRestoring { return }
+            if session.suppressesAttention { return }
+            if ShuttleAppLock.shared.isLocked {
+                self.raiseLocked(session: session)
+                return
+            }
             self.raise(session: session, title: session.attentionTitle, body: session.attentionBody)
         }
+    }
+
+    private static func resolvedTitle(_ title: String?, session: ShuttleTerminalSession) -> String {
+        let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? session.attentionTitle : trimmed
+    }
+
+    private static func resolvedBody(_ body: String?, session: ShuttleTerminalSession) -> String {
+        let trimmed = body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? session.attentionBody : trimmed
     }
 
     private func raiseLocked(session: ShuttleTerminalSession) {
@@ -93,16 +160,19 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func raise(session: ShuttleTerminalSession, title: String, body: String) {
+        if session.suppressesAttention { return }
         prepare()
         let id = session.attentionId
         insertPending(id)
         refreshBadge()
         NSApp.requestUserAttention(.informationalRequest)
         postWindowNotification(attentionId: id, title: title, body: body)
-        if banners[id] == nil {
-            showBanner(attentionId: id, title: title, body: body)
-        } else {
+        if let panel = banners[id], let view = panel.contentView as? AttentionBannerView {
+            view.titleText = title
+            view.bodyText = body
             layoutBanners()
+        } else {
+            showBanner(attentionId: id, title: title, body: body)
         }
     }
 
@@ -122,8 +192,9 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
 
     private func showBanner(attentionId: String, title: String, body: String) {
         hideBanner(attentionId)
+        let size = AttentionBannerView.bannerSize
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 76),
+            contentRect: NSRect(x: 0, y: 0, width: size.width, height: size.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -134,16 +205,25 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.becomesKeyOnlyIfNeeded = true
+        panel.isMovableByWindowBackground = false
         panel.identifier = NSUserInterfaceItemIdentifier(attentionId)
 
-        let view = AttentionBannerView(frame: NSRect(x: 0, y: 0, width: 360, height: 76))
+        let view = AttentionBannerView(frame: NSRect(x: 0, y: 0, width: size.width, height: size.height))
         view.titleText = title
         view.bodyText = body
-        view.onClick = { [weak self] in
+        view.onActivate = { [weak self] in
             if let session = ShuttleTerminalController.shared.session(attentionId: attentionId) {
                 session.makeKeyAndOrderFront()
+                self?.clear(session)
+            } else {
+                self?.drop(attentionId: attentionId)
+            }
+        }
+        view.onDismiss = { [weak self] in
+            if let session = ShuttleTerminalController.shared.session(attentionId: attentionId) {
+                session.markAttentionDismissed()
                 self?.clear(session)
             } else {
                 self?.drop(attentionId: attentionId)
@@ -161,15 +241,21 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func layoutBanners() {
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
-        var y = screen.maxY - 16
+        var yByScreen: [ObjectIdentifier: CGFloat] = [:]
         for id in pendingOrder.reversed() {
             guard let panel = banners[id] else { continue }
+            let session = ShuttleTerminalController.shared.session(attentionId: id)
+            let nsScreen = session?.window.screen ?? NSScreen.main
+            let vis = ShuttleWindowChrome.workspace(on: nsScreen)
+            let key = ObjectIdentifier(nsScreen ?? panel)
+            var y = yByScreen[key] ?? vis.maxY - 16
             let size = panel.frame.size
             y -= size.height
-            panel.setFrameOrigin(NSPoint(x: screen.maxX - size.width - 16, y: y))
+            let x = max(vis.minX + 16, vis.maxX - size.width - 16)
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
             panel.orderFrontRegardless()
             y -= 10
+            yByScreen[key] = y
         }
     }
 
@@ -192,18 +278,40 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
         let count = pendingIds.count
         let identifier = notificationIdentifier(attentionId)
         notifyQueue.async {
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            content.badge = NSNumber(value: count)
-            content.sound = nil
-            content.threadIdentifier = attentionId
-            if #available(macOS 12.0, *) {
-                content.interruptionLevel = .passive
+            if !self.notifyReady {
+                self.queuedPosts.removeAll { $0.identifier == identifier }
+                self.queuedPosts.append((identifier, title, body, count))
+                return
             }
-            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(request, withCompletionHandler: { _ in })
+            self.deliverNotification(identifier: identifier, title: title, body: body, count: count)
         }
+    }
+
+    private func flushQueuedNotifications() {
+        let queued = queuedPosts
+        queuedPosts.removeAll()
+        for item in queued {
+            deliverNotification(
+                identifier: item.identifier,
+                title: item.title,
+                body: item.body,
+                count: item.count
+            )
+        }
+    }
+
+    private func deliverNotification(identifier: String, title: String, body: String, count: Int) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.badge = NSNumber(value: count)
+        content.sound = nil
+        content.threadIdentifier = identifier
+        if #available(macOS 12.0, *) {
+            content.interruptionLevel = .active
+        }
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: { _ in })
     }
 
     private func removeWindowNotification(_ attentionId: String) {
@@ -224,7 +332,11 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([])
+        if #available(macOS 14.0, *) {
+            completionHandler([.list])
+        } else {
+            completionHandler([])
+        }
     }
 
     func userNotificationCenter(
@@ -258,45 +370,144 @@ final class ShuttleAttention: NSObject, UNUserNotificationCenterDelegate {
 }
 
 private final class AttentionBannerView: NSView {
+    static let bannerSize = NSSize(width: 344, height: 82)
+
     var titleText = "" {
-        didSet { needsDisplay = true }
+        didSet { titleLabel.stringValue = titleText }
     }
     var bodyText = "" {
-        didSet { needsDisplay = true }
+        didSet { bodyLabel.stringValue = bodyText }
     }
-    var onClick: (() -> Void)?
+    var onActivate: (() -> Void)?
+    var onDismiss: (() -> Void)?
+
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let bodyLabel = NSTextField(labelWithString: "")
+    private let closeButton = BannerCloseButton()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.94).cgColor
+        layer?.cornerRadius = 16
+        layer?.masksToBounds = true
+
+        let effect = NSVisualEffectView()
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(effect)
+
+        let icon = NSImageView()
+        icon.image = NSApp.applicationIconImage
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.wantsLayer = true
+        icon.layer?.cornerRadius = 7
+        icon.layer?.masksToBounds = true
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let appLabel = NSTextField(labelWithString: "ShuttleTerm")
+        appLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        appLabel.textColor = .secondaryLabelColor
+        appLabel.lineBreakMode = .byTruncatingTail
+        appLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        bodyLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        bodyLabel.textColor = .secondaryLabelColor
+        bodyLabel.lineBreakMode = .byTruncatingTail
+        bodyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let textStack = NSStackView(views: [appLabel, titleLabel, bodyLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        closeButton.target = self
+        closeButton.action = #selector(dismissClicked)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(icon)
+        addSubview(textStack)
+        addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            effect.topAnchor.constraint(equalTo: topAnchor),
+            effect.leadingAnchor.constraint(equalTo: leadingAnchor),
+            effect.trailingAnchor.constraint(equalTo: trailingAnchor),
+            effect.bottomAnchor.constraint(equalTo: bottomAnchor),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 32),
+            icon.heightAnchor.constraint(equalToConstant: 32),
+            closeButton.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            closeButton.widthAnchor.constraint(equalToConstant: 18),
+            closeButton.heightAnchor.constraint(equalToConstant: 18),
+            textStack.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            textStack.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
+            textStack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
     }
 
     required init?(coder: NSCoder) {
         nil
     }
 
-    override func mouseDown(with event: NSEvent) {
-        onClick?()
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if bounds.contains(point) {
+            onActivate?()
+        }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        let title = NSAttributedString(
-            string: titleText,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-                .foregroundColor: NSColor.white
-            ]
-        )
-        let body = NSAttributedString(
-            string: bodyText,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-                .foregroundColor: NSColor(calibratedWhite: 0.82, alpha: 1)
-            ]
-        )
-        title.draw(in: NSRect(x: 16, y: 40, width: bounds.width - 32, height: 22))
-        body.draw(in: NSRect(x: 16, y: 14, width: bounds.width - 32, height: 24))
+    @objc private func dismissClicked() {
+        onDismiss?()
+    }
+}
+
+private final class BannerCloseButton: NSButton {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        imagePosition = .imageOnly
+        let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
+        image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")?
+            .withSymbolConfiguration(config)
+        contentTintColor = .secondaryLabelColor
+        toolTip = "Close"
+        setAccessibilityLabel("Close")
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+        applyFill()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        applyFill()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = min(bounds.width, bounds.height) / 2
+    }
+
+    private func applyFill() {
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
     }
 }

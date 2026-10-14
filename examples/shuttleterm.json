@@ -11,6 +11,7 @@
     "  focus_on_hover, reconnect, restore_windows (coding-agent sessions resume), launch_at_login",
     "  lock_after_sleep: hide terminals after sleep or screen lock until Touch ID or password",
     "  align_grid: 5x4 | 4x3  (cells used by Align Right/Left/Top/Bottom)",
+    "  display_size: full | left | right  (half mode: Align-grid cells, swipe pages inside one half, no minimize/resize)",
     "",
     "Each host:",
     "  name       menu label",
@@ -30,6 +31,7 @@
   "restore_windows": true,
   "lock_after_sleep": false,
   "align_grid": "5x4",
+  "display_size": "full",
   "hosts": [
     {
       "name": "Example SSH",

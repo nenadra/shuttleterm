@@ -56,6 +56,7 @@ Hosts live in `~/.shuttleterm.json` (created on first run).
 | `focus_on_hover` | Focus a window when the pointer enters it |
 | `reconnect` | Wrap ssh/mosh/telnet/sftp so a drop reconnects |
 | `align_grid` | `5x4` or `4x3` — cells used by Align Right/Left/Top/Bottom |
+| `display_size` | `full`, `left`, or `right` — keep windows on the full screen or one half; half mode lays them out at Align-grid cell size, pages with a two-finger swipe (dots at the bottom), and turns off minimize and resize |
 | `lock_after_sleep` | After sleep or screen lock, require Touch ID or the Mac password before showing terminals |
 | per-host `theme` / `font` | Each window has its own background and font |
 | per-host `after` | Command run after the session starts |
@@ -71,9 +72,10 @@ Settings in the menubar also write these keys. Help → ShuttleTerm Help lists t
 - View → Theme / Font is per window; Settings default theme/font apply to every open window
 - Split 2…20 tiles terminals in a grid
 - Align Right / Left / Top / Bottom stacks terminals on that edge of the display (Settings: 5×4 or 4×3 grid; keeps current window order; changing the grid re-applies the last Align)
+- App Display Size (status menu, Window menu, or Settings: Full, Left half, Right half) keeps windows on that part of the screen. Switching from Full to a half leaves windows where they are, then snaps each to an Align-grid cell (full-screen cell size). Minimize and resize are off; drag the title bar to move. Windows already in the half stay put, and the rest stay hidden until a two-finger swipe (or Shift+wheel) pages them in. Dots overlay the bottom of a window while you swipe
 - Hosts are in File (after New Window) and in the status item
 - Window title stays the saved server name
-- Unfocused sessions that need input show a Dock badge and a banner with the host name and “Action required” (Badge App Icon in System Settings → Notifications → ShuttleTerm)
+- Unfocused sessions that need input show a Dock badge and a system-style notification (host name and “Action required”) with a close button. Hovering that window, clicking Close, or focusing it dismisses the notice (Badge App Icon in System Settings → Notifications → ShuttleTerm)
 
 This project started as an Apple Silicon fork of [Shuttle](https://github.com/fitztrev/shuttle), then added a built-in terminal using [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm). Shuttle, SwiftTerm, and LaunchAtLoginController are MIT licensed; the texts ship in the app (About ShuttleTerm) and in `ShuttleTerm/Licenses/`.
 
